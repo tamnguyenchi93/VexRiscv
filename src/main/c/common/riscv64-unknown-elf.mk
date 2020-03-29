@@ -1,4 +1,4 @@
-RISCV_BIN ?= riscv64-unknown-elf-
+RISCV_BIN ?= riscv32-unknown-elf-
 RISCV_CC=${RISCV_BIN}gcc
 RISCV_OBJCOPY=${RISCV_BIN}objcopy
 RISCV_OBJDUMP=${RISCV_BIN}objdump
