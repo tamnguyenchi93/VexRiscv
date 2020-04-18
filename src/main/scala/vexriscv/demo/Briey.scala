@@ -439,3 +439,40 @@ object BrieyDe0Nano{
     })
   }
 }
+
+
+//DE2-115
+object BrieyDe2115{
+  def main(args: Array[String]) {
+    object IS42x320B {
+      def layout = SdramLayout(
+        bankWidth   = 4,
+        columnWidth = 10,
+        rowWidth    = 13,
+        dataWidth   = 32
+      )
+	  
+      def timingGrade7 = SdramTimings(
+        bootRefreshCount =   8,
+        tPOW             = 100 us,
+        tREF             =  64 ms,
+        tRC              =  70 ns,
+        tRFC             =  70 ns,
+        tRAS             =  49 ns,
+        tRP              =  20 ns,
+        tRCD             =  20 ns,
+        cMRD             =   2,
+        tWR              =  14 ns,
+        cWR              =   1 
+      )
+    }
+    val config = SpinalConfig()
+    config.generateVerilog({
+      val toplevel = new Briey(BrieyConfig.default.copy(sdramLayout = IS42x320B.layout))
+      toplevel.axi.vgaCtrl.vga.ctrl.io.error.addAttribute(Verilator.public)
+      toplevel.axi.vgaCtrl.vga.ctrl.io.frameStart.addAttribute(Verilator.public)
+      toplevel
+    })
+  }
+}
+
