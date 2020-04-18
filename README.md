@@ -1,3 +1,7 @@
-Complete guide step-by-step can be found at:
+Original git: https://github.com/SpinalHDL/VexRiscv
 
-https://thuchoang90.github.io/vexriscv.html
+Modified hardware is at the branch **dev-chip** of this git
+
+Sample softwares can be found at: https://github.com/thuchoang90/briey_software
+
+Complete guide step-by-step can be found at: https://thuchoang90.github.io/vexriscv.html
