@@ -47,7 +47,9 @@ case class Masked(value : BigInt,care : BigInt){
 class DecoderSimplePlugin(catchIllegalInstruction : Boolean = false,
                           throwIllegalInstruction : Boolean = false,
                           assertIllegalInstruction : Boolean = false,
-                          forceLegalInstructionComputation : Boolean = false) extends Plugin[VexRiscv] with DecoderService {
+                          forceLegalInstructionComputation : Boolean = false,
+                          decoderIsolationBench : Boolean = false,
+                          stupidDecoder : Boolean = false) extends Plugin[VexRiscv] with DecoderService {
   override def add(encoding: Seq[(MaskedLiteral, Seq[(Stageable[_ <: BaseType], Any)])]): Unit = encoding.foreach(e => this.add(e._1,e._2))
   override def add(key: MaskedLiteral, values: Seq[(Stageable[_ <: BaseType], Any)]): Unit = {
     val instructionModel = encodings.getOrElseUpdate(key,ArrayBuffer[(Stageable[_ <: BaseType], BaseType)]())
@@ -69,12 +71,17 @@ class DecoderSimplePlugin(catchIllegalInstruction : Boolean = false,
     }
   }
 
+  def forceIllegal() : Unit = if(catchIllegalInstruction) pipeline.decode.input(pipeline.config.LEGAL_INSTRUCTION) := False
+
   val defaults = mutable.LinkedHashMap[Stageable[_ <: BaseType], BaseType]()
   val encodings = mutable.LinkedHashMap[MaskedLiteral,ArrayBuffer[(Stageable[_ <: BaseType], BaseType)]]()
   var decodeExceptionPort : Flow[ExceptionCause] = null
 
 
   override def setup(pipeline: VexRiscv): Unit = {
+    if(!catchIllegalInstruction) {
+      SpinalWarning("This VexRiscv configuration is set without illegal instruction catch support. Some software may rely on it (ex: Rust)")
+    }
     if(catchIllegalInstruction) {
       val exceptionService = pipeline.plugins.filter(_.isInstanceOf[ExceptionService]).head.asInstanceOf[ExceptionService]
       decodeExceptionPort = exceptionService.newExceptionPort(pipeline.decode).setName("decodeExceptionPort")
@@ -89,9 +96,9 @@ class DecoderSimplePlugin(catchIllegalInstruction : Boolean = false,
     import pipeline.config._
     import pipeline.decode._
 
-    val stageables = (encodings.flatMap(_._2.map(_._1)) ++ defaults.map(_._1)).toSet.toList
+    val stageables = (encodings.flatMap(_._2.map(_._1)) ++ defaults.map(_._1)).toList.distinct
 
-    val stupidDecoder = false
+
     if(stupidDecoder){
       if (detectLegalInstructions) insert(LEGAL_INSTRUCTION) := False
       for(stageable <- stageables){
@@ -160,6 +167,11 @@ class DecoderSimplePlugin(catchIllegalInstruction : Boolean = false,
       if(assertIllegalInstruction){
         val reg = RegInit(False) setWhen(arbitration.isValid) clearWhen(arbitration.isRemoved || !arbitration.isStuck)
         insert(ASSERT_ERROR) := arbitration.isValid || reg
+      }
+
+      if(decoderIsolationBench){
+        KeepAttribute(RegNext(KeepAttribute(RegNext(decodedBits.removeAssignments().asInput()))))
+        out(Bits(32 bits)).setName("instruction") := KeepAttribute(RegNext(KeepAttribute(RegNext(input(INSTRUCTION)))))
       }
 
       //Unpack decodedBits and insert fields in the pipeline

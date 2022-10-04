@@ -8,7 +8,7 @@ import spinal.lib._
 import scala.beans.BeanProperty
 
 trait JumpService{
-  def createJumpInterface(stage : Stage, priority : Int = 0) : Flow[UInt]
+  def createJumpInterface(stage : Stage, priority : Int = 0) : Flow[UInt] //High priority win
 }
 
 trait IBusFetcher{
@@ -16,6 +16,8 @@ trait IBusFetcher{
   def incoming() : Bool
   def pcValid(stage : Stage) : Bool
   def getInjectionPort() : Stream[Bits]
+  def withRvc() : Boolean
+  def forceNoDecode() : Unit
 }
 
 
@@ -23,15 +25,23 @@ trait DecoderService{
   def add(key : MaskedLiteral,values : Seq[(Stageable[_ <: BaseType],Any)])
   def add(encoding :Seq[(MaskedLiteral,Seq[(Stageable[_ <: BaseType],Any)])])
   def addDefault(key : Stageable[_ <: BaseType], value : Any)
+  def forceIllegal() : Unit
 }
 
-case class ExceptionCause() extends Bundle{
-  val code = UInt(4 bits)
+case class ExceptionCause(codeWidth : Int) extends Bundle{
+  val code = UInt(codeWidth bits)
   val badAddr = UInt(32 bits)
+
+  def resizeCode(width : Int): ExceptionCause ={
+    val ret = ExceptionCause(width)
+    ret.badAddr := badAddr
+    ret.code := code.resized
+    ret
+  }
 }
 
 trait ExceptionService{
-  def newExceptionPort(stage : Stage, priority : Int = 0) : Flow[ExceptionCause]
+  def newExceptionPort(stage : Stage, priority : Int = 0, codeWidth : Int = 4) : Flow[ExceptionCause]
   def isExceptionPending(stage : Stage) : Bool
 }
 
@@ -55,6 +65,7 @@ trait InterruptionInhibitor{
 
 trait ExceptionInhibitor{
   def inhibateException() : Unit
+  def inhibateEbreakException() : Unit
 }
 
 
@@ -65,20 +76,29 @@ trait RegFileService{
 
 case class MemoryTranslatorCmd() extends Bundle{
   val isValid = Bool
+  val isStuck = Bool
   val virtualAddress  = UInt(32 bits)
   val bypassTranslation = Bool
 }
-case class MemoryTranslatorRsp() extends Bundle{
+case class MemoryTranslatorRsp(p : MemoryTranslatorBusParameter) extends Bundle{
   val physicalAddress = UInt(32 bits)
   val isIoAccess = Bool
+  val isPaging = Bool
   val allowRead, allowWrite, allowExecute = Bool
   val exception = Bool
   val refilling = Bool
+  val bypassTranslation = Bool
+  val ways = Vec(MemoryTranslatorRspWay(), p.wayCount)
+}
+case class MemoryTranslatorRspWay() extends Bundle{
+  val sel = Bool()
+  val physical = UInt(32 bits)
 }
 
-case class MemoryTranslatorBus() extends Bundle with IMasterSlave{
-  val cmd = MemoryTranslatorCmd()
-  val rsp = MemoryTranslatorRsp()
+case class MemoryTranslatorBusParameter(wayCount : Int = 0, latency : Int = 0)
+case class MemoryTranslatorBus(p : MemoryTranslatorBusParameter) extends Bundle with IMasterSlave{
+  val cmd = Vec(MemoryTranslatorCmd(), p.latency + 1)
+  val rsp = MemoryTranslatorRsp(p)
   val end = Bool
   val busy = Bool
 

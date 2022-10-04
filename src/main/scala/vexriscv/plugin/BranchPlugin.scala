@@ -46,6 +46,7 @@ case class FetchPredictionBus(stage : Stage) extends Bundle {
 trait PredictionInterface{
   def askFetchPrediction() : FetchPredictionBus
   def askDecodePrediction() : DecodePredictionBus
+  def inDebugNoFetch() : Unit
 }
 
 
@@ -57,7 +58,7 @@ class BranchPlugin(earlyBranch : Boolean,
                    decodeBranchSrc2 : Boolean = false) extends Plugin[VexRiscv] with PredictionInterface{
 
 
-  def catchAddressMisalignedForReal = catchAddressMisaligned && !pipeline(RVC_GEN)
+  def catchAddressMisalignedForReal = catchAddressMisaligned && !pipeline.config.withRvc
   lazy val branchStage = if(earlyBranch) pipeline.execute else pipeline.memory
 
   object BRANCH_CALC extends Stageable(UInt(32 bits))
@@ -66,9 +67,9 @@ class BranchPlugin(earlyBranch : Boolean,
   object IS_FENCEI extends Stageable(Bool)
 
   var jumpInterface : Flow[UInt] = null
-  var predictionJumpInterface : Flow[UInt] = null
   var predictionExceptionPort : Flow[ExceptionCause] = null
   var branchExceptionPort : Flow[ExceptionCause] = null
+  var inDebugNoFetchFlag : Bool = null
 
 
   var decodePrediction : DecodePredictionBus = null
@@ -84,6 +85,9 @@ class BranchPlugin(earlyBranch : Boolean,
     decodePrediction = DecodePredictionBus(branchStage)
     decodePrediction
   }
+
+
+  override def inDebugNoFetch(): Unit = inDebugNoFetchFlag := True
 
   def hasHazardOnBranch = if(earlyBranch) pipeline.service(classOf[HazardService]).hazardOnExecuteRS else False
 
@@ -115,7 +119,6 @@ class BranchPlugin(earlyBranch : Boolean,
 
 
     decoderService.addDefault(BRANCH_CTRL, BranchCtrlEnum.INC)
-    val rvc = pipeline(RVC_GEN)
     decoderService.add(List(
       JAL(true)  -> (jActions ++ List(BRANCH_CTRL -> BranchCtrlEnum.JAL, ALU_CTRL -> AluCtrlEnum.ADD_SUB)),
       JALR       -> (jActions ++ List(BRANCH_CTRL -> BranchCtrlEnum.JALR, ALU_CTRL -> AluCtrlEnum.ADD_SUB, RS1_USE -> True)),
@@ -139,13 +142,17 @@ class BranchPlugin(earlyBranch : Boolean,
     }
 
     val pcManagerService = pipeline.service(classOf[JumpService])
-    jumpInterface = pcManagerService.createJumpInterface(branchStage)
+
+    //Priority -1, as DYNAMIC_TARGET misspredicted on non branch instruction should lose against other instructions
+    //legitim branches, as MRET for instance
+    jumpInterface = pcManagerService.createJumpInterface(branchStage, priority = -10)
 
 
     if (catchAddressMisalignedForReal) {
       val exceptionService = pipeline.service(classOf[ExceptionService])
       branchExceptionPort = exceptionService.newExceptionPort(branchStage)
     }
+    inDebugNoFetchFlag = False.setCompositeName(this, "inDebugNoFetchFlag")
   }
 
   override def build(pipeline: VexRiscv): Unit = {
@@ -250,7 +257,7 @@ class BranchPlugin(earlyBranch : Boolean,
       )
 
       val imm = IMM(input(INSTRUCTION))
-      val missAlignedTarget = if(pipeline(RVC_GEN)) False else (input(BRANCH_COND_RESULT) && input(BRANCH_CTRL).mux(
+      val missAlignedTarget = if(pipeline.config.withRvc) False else (input(BRANCH_COND_RESULT) && input(BRANCH_CTRL).mux(
         BranchCtrlEnum.JALR -> (imm.i_sext(1) ^ input(RS1)(1)),
         BranchCtrlEnum.JAL  ->  imm.j_sext(1),
         default             ->  imm.b_sext(1)
@@ -269,7 +276,7 @@ class BranchPlugin(earlyBranch : Boolean,
           branch_src1 := input(PC)
           branch_src2 := ((input(BRANCH_CTRL) === BranchCtrlEnum.JAL) ? imm.j_sext | imm.b_sext).asUInt
           when(input(PREDICTION_HAD_BRANCHED)){ //Assume the predictor never predict missaligned stuff, this avoid the need to know if the instruction should branch or not
-            branch_src2 := (if(pipeline(RVC_GEN)) Mux(input(IS_RVC), B(2), B(4)) else B(4)).asUInt.resized
+            branch_src2 := (if(pipeline.config.withRvc) Mux(input(IS_RVC), B(2), B(4)) else B(4)).asUInt.resized
           }
         }
       }
@@ -342,7 +349,7 @@ class BranchPlugin(earlyBranch : Boolean,
 
       val branchAdder = branch_src1 + input(BRANCH_SRC2)
       insert(BRANCH_CALC) := branchAdder(31 downto 1) @@ U"0"
-      insert(NEXT_PC) := input(PC) + (if(pipeline(RVC_GEN)) ((input(IS_RVC)) ? U(2) | U(4)) else 4)
+      insert(NEXT_PC) := input(PC) + (if(pipeline.config.withRvc) ((input(IS_RVC)) ? U(2) | U(4)) else 4)
       insert(TARGET_MISSMATCH) := decode.input(PC) =/= input(BRANCH_CALC)
     }
 
@@ -352,10 +359,11 @@ class BranchPlugin(earlyBranch : Boolean,
       import branchStage._
 
       val predictionMissmatch = fetchPrediction.cmd.hadBranch =/= input(BRANCH_DO) || (input(BRANCH_DO) && input(TARGET_MISSMATCH))
+      when(inDebugNoFetchFlag) { predictionMissmatch := input(BRANCH_DO)}
       fetchPrediction.rsp.wasRight := ! predictionMissmatch
       fetchPrediction.rsp.finalPc := input(BRANCH_CALC)
       fetchPrediction.rsp.sourceLastWord := {
-        if(pipeline(RVC_GEN))
+        if(pipeline.config.withRvc)
           ((!input(IS_RVC) && input(PC)(1)) ? input(NEXT_PC) | input(PC))
         else
           input(PC)

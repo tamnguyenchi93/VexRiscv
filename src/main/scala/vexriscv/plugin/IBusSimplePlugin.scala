@@ -83,7 +83,7 @@ object IBusSimpleBus{
     canRead = true,
     canWrite = false,
     alignment     = BmbParameter.BurstAlignement.LENGTH,
-    maximumPendingTransactionPerId = if(plugin != null) plugin.pendingMax else Int.MaxValue
+    maximumPendingTransaction = if(plugin != null) plugin.pendingMax else Int.MaxValue
   )
 }
 
@@ -180,6 +180,7 @@ case class IBusSimpleBus(plugin: IBusSimplePlugin) extends Bundle with IMasterSl
 
   //cmdForkPersistence need to bet set
   def toAhbLite3Master(): AhbLite3Master = {
+    assert(plugin.cmdForkPersistence)
     val bus = AhbLite3Master(IBusSimpleBus.getAhbLite3Config())
     bus.HADDR     := this.cmd.pc
     bus.HWRITE    := False
@@ -234,7 +235,9 @@ class IBusSimplePlugin(    resetVector : BigInt,
                        val singleInstructionPipeline : Boolean = false,
                        val memoryTranslatorPortConfig : Any = null,
                            relaxPredictorAddress : Boolean = true,
-                           predictionBuffer : Boolean = true
+                           predictionBuffer : Boolean = true,
+                           bigEndian : Boolean = false,
+                           vecRspBuffer : Boolean = false
                       ) extends IBusFetcherImpl(
     resetVector = resetVector,
     keepPcPlus4 = keepPcPlus4,
@@ -318,9 +321,9 @@ class IBusSimplePlugin(    resetVector : BigInt,
       }
 
       val mmu = (mmuBus != null) generate new Area {
-        mmuBus.cmd.isValid := cmdForkStage.input.valid
-        mmuBus.cmd.virtualAddress := cmdForkStage.input.payload
-        mmuBus.cmd.bypassTranslation := False
+        mmuBus.cmd.last.isValid := cmdForkStage.input.valid
+        mmuBus.cmd.last.virtualAddress := cmdForkStage.input.payload
+        mmuBus.cmd.last.bypassTranslation := False
         mmuBus.end := cmdForkStage.output.fire || externalFlush
 
         cmd.pc := mmuBus.rsp.physicalAddress(31 downto 2) @@ U"00"
@@ -349,7 +352,7 @@ class IBusSimplePlugin(    resetVector : BigInt,
         //Manage flush for iBus transactions in flight
         val rspBuffer = new Area {
           val output = Stream(IBusSimpleRsp())
-          val c = StreamFifoLowLatency(IBusSimpleRsp(), busLatencyMin + (if(cmdForkOnSecondStage && cmdForkPersistence) 1 else 0))
+          val c = new StreamFifoLowLatency(IBusSimpleRsp(), busLatencyMin + (if(cmdForkOnSecondStage && cmdForkPersistence) 1 else 0), useVec = vecRspBuffer)
           val discardCounter = Reg(UInt(log2Up(pendingMax + 1) bits)) init (0)
           discardCounter := discardCounter - (c.io.pop.valid && discardCounter =/= 0).asUInt
           when(iBusRsp.flush) {
@@ -371,6 +374,11 @@ class IBusSimplePlugin(    resetVector : BigInt,
         fetchRsp.pc := stages.last.output.payload
         fetchRsp.rsp := rspBuffer.output.payload
         fetchRsp.rsp.error.clearWhen(!rspBuffer.output.valid) //Avoid interference with instruction injection from the debug plugin
+        if(bigEndian){
+          // instructions are stored in little endian byteorder
+          fetchRsp.rsp.inst.allowOverride
+          fetchRsp.rsp.inst := EndiannessSwap(rspBuffer.output.payload.inst)
+        }
 
         val join = Stream(FetchRsp())
         val exceptionDetected = False

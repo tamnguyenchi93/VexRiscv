@@ -5,6 +5,7 @@ import spinal.core._
 import spinal.lib._
 import spinal.lib.bus.bmb.WeakConnector
 import spinal.lib.bus.misc.{AddressMapping, DefaultMapping}
+import vexriscv.Riscv.IMM
 
 case class CfuPluginParameter(
                         CFU_VERSION : Int,
@@ -19,24 +20,30 @@ case class CfuPluginParameter(
                         CFU_FLOW_REQ_READY_ALWAYS : Boolean,
                         CFU_FLOW_RESP_READY_ALWAYS : Boolean)
 
-case class CfuBusParameter(CFU_VERSION : Int,
-                           CFU_INTERFACE_ID_W : Int,
+case class CfuBusParameter(CFU_VERSION : Int = 0,
+                           CFU_INTERFACE_ID_W : Int = 0,
                            CFU_FUNCTION_ID_W : Int,
-                           CFU_REORDER_ID_W : Int,
-                           CFU_REQ_RESP_ID_W : Int,
+                           CFU_CFU_ID_W : Int = 0,
+                           CFU_REORDER_ID_W : Int = 0,
+                           CFU_REQ_RESP_ID_W : Int = 0,
+                           CFU_STATE_INDEX_NUM : Int = 0,
                            CFU_INPUTS : Int,
                            CFU_INPUT_DATA_W : Int,
                            CFU_OUTPUTS : Int,
                            CFU_OUTPUT_DATA_W : Int,
                            CFU_FLOW_REQ_READY_ALWAYS : Boolean,
-                           CFU_FLOW_RESP_READY_ALWAYS : Boolean)
+                           CFU_FLOW_RESP_READY_ALWAYS : Boolean,
+                           CFU_WITH_STATUS : Boolean = false,
+                           CFU_RAW_INSN_W : Int = 0)
 
 case class CfuCmd( p : CfuBusParameter ) extends Bundle{
   val function_id = UInt(p.CFU_FUNCTION_ID_W bits)
   val reorder_id = UInt(p.CFU_REORDER_ID_W bits)
   val request_id = UInt(p.CFU_REQ_RESP_ID_W bits)
   val inputs = Vec(Bits(p.CFU_INPUT_DATA_W bits), p.CFU_INPUTS)
-
+  val state_index = UInt(log2Up(p.CFU_STATE_INDEX_NUM) bits)
+  val cfu_index = UInt(p.CFU_CFU_ID_W bits)
+  val raw_insn = Bits(p.CFU_RAW_INSN_W bits)
   def weakAssignFrom(m : CfuCmd): Unit ={
     def s = this
     WeakConnector(m, s, m.function_id, s.function_id, defaultValue = null, allowUpSize = false, allowDownSize = true , allowDrop = true)
@@ -47,13 +54,12 @@ case class CfuCmd( p : CfuBusParameter ) extends Bundle{
 }
 
 case class CfuRsp(p : CfuBusParameter) extends Bundle{
-  val response_ok = Bool()
   val response_id = UInt(p.CFU_REQ_RESP_ID_W bits)
   val outputs = Vec(Bits(p.CFU_OUTPUT_DATA_W bits), p.CFU_OUTPUTS)
+  val status = p.CFU_WITH_STATUS generate Bits(3 bits)
 
   def weakAssignFrom(m : CfuRsp): Unit ={
     def s = this
-    s.response_ok := m.response_ok
     s.response_id := m.response_id
     s.outputs := m.outputs
   }
@@ -78,20 +84,32 @@ case class CfuBus(p : CfuBusParameter) extends Bundle with IMasterSlave{
   }
 }
 
+object CfuPlugin{
+  object Input2Kind extends SpinalEnum{
+    val RS, IMM_I = newElement()
+  }
+}
 
+case class CfuPluginEncoding(instruction : MaskedLiteral,
+                             functionId : List[Range],
+                             input2Kind : CfuPlugin.Input2Kind.E){
+  val functionIdWidth = functionId.map(_.size).sum
+}
 
-class CfuPlugin( val stageCount : Int,
-                 val allowZeroLatency : Boolean,
-                 val encoding : MaskedLiteral,
-                 val busParameter : CfuBusParameter) extends Plugin[VexRiscv]{
+class CfuPlugin(val stageCount : Int,
+                val allowZeroLatency : Boolean,
+                val busParameter : CfuBusParameter,
+                val encodings : List[CfuPluginEncoding] = null,
+                val stateAndIndexCsrOffset : Int = 0xBC0,
+                val statusCsrOffset : Int = 0x801,
+                val withEnable : Boolean = true) extends Plugin[VexRiscv]{
   def p = busParameter
 
   assert(p.CFU_INPUTS <= 2)
   assert(p.CFU_OUTPUTS == 1)
-  assert(p.CFU_FUNCTION_ID_W == 3)
+//  assert(p.CFU_FUNCTION_ID_W == 3)
 
   var bus : CfuBus = null
-  var joinException : Flow[ExceptionCause] = null
 
   lazy val forkStage = pipeline.execute
   lazy val joinStage = pipeline.stages(Math.min(pipeline.stages.length - 1, pipeline.indexOf(forkStage) + stageCount))
@@ -99,51 +117,103 @@ class CfuPlugin( val stageCount : Int,
 
   val CFU_ENABLE = new Stageable(Bool()).setCompositeName(this, "CFU_ENABLE")
   val CFU_IN_FLIGHT = new Stageable(Bool()).setCompositeName(this, "CFU_IN_FLIGHT")
-
+  val CFU_ENCODING = new Stageable(UInt(log2Up(encodings.size) bits)).setCompositeName(this, "CFU_ENCODING")
+  val CFU_INPUT_2_KIND = new Stageable(CfuPlugin.Input2Kind()).setCompositeName(this, "CFU_INPUT_2_KIND")
 
   override def setup(pipeline: VexRiscv): Unit = {
     import pipeline._
     import pipeline.config._
 
     bus = master(CfuBus(p))
-    joinException = pipeline.service(classOf[ExceptionService]).newExceptionPort(joinStage)
 
     val decoderService = pipeline.service(classOf[DecoderService])
     decoderService.addDefault(CFU_ENABLE, False)
 
-    //custom-0
-    decoderService.add(List(
-      encoding  -> List(
+    for((encoding, id) <- encodings.zipWithIndex){
+      var actions = List(
         CFU_ENABLE -> True,
         REGFILE_WRITE_VALID      -> True,
         BYPASSABLE_EXECUTE_STAGE -> Bool(stageCount == 0),
         BYPASSABLE_MEMORY_STAGE  -> Bool(stageCount <= 1),
         RS1_USE -> True,
-        RS2_USE -> True
+        CFU_ENCODING -> U(id),
+        CFU_INPUT_2_KIND -> encoding.input2Kind()
       )
-    ))
+
+      encoding.input2Kind match {
+        case CfuPlugin.Input2Kind.RS =>
+          actions :+= RS2_USE -> True
+        case CfuPlugin.Input2Kind.IMM_I =>
+      }
+
+      decoderService.add(
+        key = encoding.instruction,
+        values = actions
+      )
+    }
   }
 
   override def build(pipeline: VexRiscv): Unit = {
     import pipeline._
     import pipeline.config._
 
+    val csr = pipeline plug new Area{
+      val factory = pipeline.service(classOf[CsrInterface])
+      val en = withEnable generate (Reg(Bool()) init(False))
+      if(withEnable) factory.rw(stateAndIndexCsrOffset, 31, en)
+
+      val stateId = Reg(UInt(log2Up(p.CFU_STATE_INDEX_NUM) bits)) init(0)
+      if(p.CFU_STATE_INDEX_NUM > 1) {
+        assert(stateAndIndexCsrOffset != -1, "CfuPlugin stateCsrIndex need to be set in the parameters")
+        factory.rw(stateAndIndexCsrOffset, 16, stateId)
+      }
+
+      val cfuIndex = Reg(UInt(p.CFU_CFU_ID_W bits)) init(0)
+      if(p.CFU_CFU_ID_W != 0){
+        factory.rw(stateAndIndexCsrOffset, 0, cfuIndex)
+      }
+      val status = p.CFU_WITH_STATUS generate new Area{
+        val CU, OP, FI, OF, SI, CI = RegInit(False)
+        val flags = List(CU, OP, FI, OF, SI, CI).reverse
+        factory.rw(statusCsrOffset,  flags.zipWithIndex.map(_.swap) :_*)
+        factory.duringWrite(statusCsrOffset){
+          decode.arbitration.haltByOther := True //Handle CSRW to decode
+        }
+      }
+    }
+
+    if(withEnable) when(decode.input(CFU_ENABLE) && !csr.en){
+      pipeline.service(classOf[DecoderService]).forceIllegal()
+    }
 
     forkStage plug new Area{
       import forkStage._
-      val schedule = arbitration.isValid && input(CFU_ENABLE)
+      val hazard = stages.dropWhile(_ != forkStage).tail.map(s => s.arbitration.isValid && s.input(HAS_SIDE_EFFECT)).orR
+      val scheduleWish = arbitration.isValid && input(CFU_ENABLE)
+      val schedule = scheduleWish && !hazard
+      arbitration.haltItself setWhen(scheduleWish && hazard)
+
       val hold = RegInit(False) setWhen(schedule) clearWhen(bus.cmd.ready)
-      val fired = RegInit(False) setWhen(bus.cmd.fire) clearWhen(!arbitration.isStuckByOthers)
+      val fired = RegInit(False) setWhen(bus.cmd.fire) clearWhen(!arbitration.isStuck)
       insert(CFU_IN_FLIGHT) := schedule || hold || fired
 
       bus.cmd.valid := (schedule || hold) && !fired
       arbitration.haltItself setWhen(bus.cmd.valid && !bus.cmd.ready)
 
-      bus.cmd.function_id := U(input(INSTRUCTION)(14 downto 12)).resized
+//      bus.cmd.function_id := U(input(INSTRUCTION)(14 downto 12)).resized
+      val functionIdFromInstructinoWidth = encodings.map(_.functionIdWidth).max
+      val functionsIds = encodings.map(e => U(Cat(e.functionId.map(r => input(INSTRUCTION)(r))), functionIdFromInstructinoWidth bits))
+      bus.cmd.cfu_index := csr.cfuIndex
+      bus.cmd.state_index := csr.stateId
+      bus.cmd.function_id := functionsIds.read(input(CFU_ENCODING))
       bus.cmd.reorder_id := 0
       bus.cmd.request_id := 0
+      bus.cmd.raw_insn   := input(INSTRUCTION).resized
       if(p.CFU_INPUTS >= 1) bus.cmd.inputs(0) := input(RS1)
-      if(p.CFU_INPUTS >= 2) bus.cmd.inputs(1) := input(RS2)
+      if(p.CFU_INPUTS >= 2)  bus.cmd.inputs(1) := input(CFU_INPUT_2_KIND).mux(
+        CfuPlugin.Input2Kind.RS -> input(RS2),
+        CfuPlugin.Input2Kind.IMM_I -> IMM(input(INSTRUCTION)).h_sext
+      )
     }
 
     joinStage plug new Area{
@@ -157,27 +227,27 @@ class CfuPlugin( val stageCount : Int,
           latency = 0
         )
       } else if(forkStage != joinStage && allowZeroLatency) {
-        bus.rsp.m2sPipe()
+        bus.rsp.s2mPipe()
       } else {
         bus.rsp.combStage()
       }
-
-      joinException.valid := False
-      joinException.code := 15
-      joinException.badAddr := 0
 
       rsp.ready := False
       when(input(CFU_IN_FLIGHT)){
         arbitration.haltItself setWhen(!rsp.valid)
         rsp.ready := !arbitration.isStuckByOthers
         output(REGFILE_WRITE_DATA) := rsp.outputs(0)
-
-        when(arbitration.isValid){
-          joinException.valid := !rsp.response_ok
+        if(p.CFU_WITH_STATUS) when(arbitration.isFiring){
+          switch(rsp.status) {
+            for (i <- 1 to 6) is(i) {
+              csr.status.flags(i-1) := True
+            }
+          }
         }
       }
     }
 
+    pipeline.stages.drop(1).foreach(s => s.output(CFU_IN_FLIGHT) clearWhen(s.arbitration.isStuck))
     addPrePopTask(() => stages.dropWhile(_ != memory).reverse.dropWhile(_ != joinStage).foreach(s => s.input(CFU_IN_FLIGHT).init(False)))
   }
 }
@@ -206,7 +276,6 @@ case class CfuTest() extends Component{
     val bus = slave(CfuBus(CfuTest.getCfuParameter()))
   }
   io.bus.rsp.arbitrationFrom(io.bus.cmd)
-  io.bus.rsp.response_ok := True
   io.bus.rsp.response_id := io.bus.cmd.request_id
   io.bus.rsp.outputs(0) := ~(io.bus.cmd.inputs(0) & io.bus.cmd.inputs(1))
 }
@@ -275,7 +344,6 @@ case class CfuDecoder(p : CfuBusParameter,
     io.input.rsp.payload := io.outputs.map(_.rsp.payload).read(OHToUInt(rspHits))
     if(!hasDefault) when(rspNoHit.doIt) {
       io.input.rsp.valid := True
-      io.input.rsp.response_ok := False
       io.input.rsp.response_id := rspNoHit.response_id
     }
     for(output <- io.outputs) output.rsp.ready := io.input.rsp.ready

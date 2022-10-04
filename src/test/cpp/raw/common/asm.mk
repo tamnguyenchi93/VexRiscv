@@ -18,6 +18,9 @@ endif
 ifeq ($(COMPRESSED),yes)
 	MARCH := $(MARCH)c
 endif
+ifeq ($(FLOATING),yes)
+	MARCH := $(MARCH)fd
+endif
 
 CFLAGS += -march=$(MARCH)  -mabi=$(MABI)
 LDFLAGS += -march=$(MARCH)  -mabi=$(MABI)
@@ -40,7 +43,7 @@ OBJS := $(addprefix $(OBJDIR)/,$(OBJS))
 
 
 
-all: $(OBJDIR)/$(PROJ_NAME).elf $(OBJDIR)/$(PROJ_NAME).hex $(OBJDIR)/$(PROJ_NAME).asm
+all: $(OBJDIR)/$(PROJ_NAME).elf $(OBJDIR)/$(PROJ_NAME).hex $(OBJDIR)/$(PROJ_NAME).asm $(OBJDIR)/$(PROJ_NAME).bin
 	@echo "done"
 
 $(OBJDIR)/%.elf: $(OBJS) | $(OBJDIR)

@@ -16,6 +16,7 @@ import vexriscv.{VexRiscv, VexRiscvConfig, plugin}
 import spinal.lib.com.spi.ddr._
 import spinal.lib.bus.simple._
 import scala.collection.mutable.ArrayBuffer
+import scala.collection.Seq
 
 /**
  * Created by PIC32F_USER on 28/07/2017.
@@ -52,8 +53,8 @@ case class MuraxConfig(coreFrequency : HertzNumber,
 
 
 object MuraxConfig{
-  def default : MuraxConfig = default(false)
-  def default(withXip : Boolean) =  MuraxConfig(
+  def default : MuraxConfig = default(false, false)
+  def default(withXip : Boolean = false, bigEndian : Boolean = false) =  MuraxConfig(
     coreFrequency         = 12 MHz,
     onChipRamSize         = 8 kB,
     onChipRamHexFile      = null,
@@ -75,12 +76,14 @@ object MuraxConfig{
         cmdForkPersistence = withXip, //Required by the Xip controller
         prediction = NONE,
         catchAccessFault = false,
-        compressedGen = false
+        compressedGen = false,
+        bigEndian = bigEndian
       ),
       new DBusSimplePlugin(
         catchAddressMisaligned = false,
         catchAccessFault = false,
-        earlyInjection = false
+        earlyInjection = false,
+        bigEndian = bigEndian
       ),
       new CsrPlugin(CsrPluginConfig.smallest(mtvecInit = if(withXip) 0xE0040020l else 0x80000020l)),
       new DecoderSimplePlugin(
@@ -155,8 +158,8 @@ case class Murax(config : MuraxConfig) extends Component{
 
   val io = new Bundle {
     //Clocks / reset
-    val asyncReset = in Bool
-    val mainClk = in Bool
+    val asyncReset = in Bool()
+    val mainClk = in Bool()
 
     //Main components IO
     val jtag = slave(Jtag())
@@ -214,9 +217,11 @@ case class Murax(config : MuraxConfig) extends Component{
       dataWidth = 32
     )
 
+    val bigEndianDBus = config.cpuPlugins.exists(_ match{ case plugin : DBusSimplePlugin => plugin.bigEndian case _ => false})
+
     //Arbiter of the cpu dBus/iBus to drive the mainBus
     //Priority to dBus, !! cmd transactions can change on the fly !!
-    val mainBusArbiter = new MuraxMasterArbiter(pipelinedMemoryBusConfig)
+    val mainBusArbiter = new MuraxMasterArbiter(pipelinedMemoryBusConfig, bigEndianDBus)
 
     //Instanciate the CPU
     val cpu = new VexRiscv(
@@ -258,7 +263,8 @@ case class Murax(config : MuraxConfig) extends Component{
     val ram = new MuraxPipelinedMemoryBusRam(
       onChipRamSize = onChipRamSize,
       onChipRamHexFile = onChipRamHexFile,
-      pipelinedMemoryBusConfig = pipelinedMemoryBusConfig
+      pipelinedMemoryBusConfig = pipelinedMemoryBusConfig,
+      bigEndian = bigEndianDBus
     )
     mainBusMapping += ram.io.bus -> (0x80000000l, onChipRamSize)
 
@@ -308,13 +314,13 @@ case class Murax(config : MuraxConfig) extends Component{
     //******** Memory mappings *********
     val apbDecoder = Apb3Decoder(
       master = apbBridge.io.apb,
-      slaves = apbMapping
+      slaves = apbMapping.toSeq
     )
 
     val mainBusDecoder = new Area {
       val logic = new MuraxPipelinedMemoryBusDecoder(
         master = mainBusArbiter.io.masterBus,
-        specification = mainBusMapping,
+        specification = mainBusMapping.toSeq,
         pipelineMaster = pipelineMainBus
       )
     }
@@ -328,6 +334,54 @@ object Murax{
     SpinalVerilog(Murax(MuraxConfig.default))
   }
 }
+
+object MuraxCfu{
+  def main(args: Array[String]) {
+    SpinalVerilog{
+      val config = MuraxConfig.default
+      config.cpuPlugins += new CfuPlugin(
+        stageCount = 1,
+        allowZeroLatency = true,
+        encodings = List(
+          CfuPluginEncoding (
+            instruction = M"-------------------------0001011",
+            functionId = List(14 downto 12),
+            input2Kind = CfuPlugin.Input2Kind.RS
+          )
+        ),
+        busParameter = CfuBusParameter(
+          CFU_VERSION = 0,
+          CFU_INTERFACE_ID_W = 0,
+          CFU_FUNCTION_ID_W = 3,
+          CFU_REORDER_ID_W = 0,
+          CFU_REQ_RESP_ID_W = 0,
+          CFU_INPUTS = 2,
+          CFU_INPUT_DATA_W = 32,
+          CFU_OUTPUTS = 1,
+          CFU_OUTPUT_DATA_W = 32,
+          CFU_FLOW_REQ_READY_ALWAYS = false,
+          CFU_FLOW_RESP_READY_ALWAYS = false,
+          CFU_WITH_STATUS = true,
+          CFU_RAW_INSN_W = 32,
+          CFU_CFU_ID_W = 4,
+          CFU_STATE_INDEX_NUM = 5
+        )
+      )
+
+      val toplevel = Murax(config)
+
+      toplevel.rework {
+        for (plugin <- toplevel.system.cpu.plugins) plugin match {
+          case plugin: CfuPlugin => plugin.bus.toIo().setName("miaou")
+          case _ =>
+        }
+      }
+
+      toplevel
+    }
+  }
+}
+
 
 object Murax_iCE40_hx8k_breakout_board_xip{
 
@@ -478,3 +532,12 @@ object Murax_arty{
     SpinalVerilog(Murax(MuraxConfig.default(false).copy(coreFrequency = 100 MHz,onChipRamSize = 32 kB, onChipRamHexFile = hex)))
   }
 }
+
+
+object MuraxAsicBlackBox extends App{
+  println("Warning this soc do not has any rom to boot on.")
+  val config = SpinalConfig()
+  config.addStandardMemBlackboxing(blackboxAll)
+  config.generateVerilog(Murax(MuraxConfig.default()))
+}
+

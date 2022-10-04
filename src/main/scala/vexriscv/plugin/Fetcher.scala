@@ -33,10 +33,14 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
 //  assert(!(cmdToRspStageCount == 1 && !injectorStage))
   assert(!(compressedGen && !decodePcGen))
   var fetcherHalt : Bool = null
+  var forceNoDecodeCond : Bool = null
   var pcValids : Vec[Bool] = null
   def pcValid(stage : Stage) = pcValids(pipeline.indexOf(stage))
   var incomingInstruction : Bool = null
   override def incoming() = incomingInstruction
+
+
+  override def withRvc(): Boolean = compressedGen
 
   var injectionPort : Stream[Bits] = null
   override def getInjectionPort() = {
@@ -47,6 +51,7 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
   var predictionJumpInterface : Flow[UInt] = null
 
   override def haltIt(): Unit = fetcherHalt := True
+  override def forceNoDecode(): Unit = forceNoDecodeCond := True
   case class JumpInfo(interface :  Flow[UInt], stage: Stage, priority : Int)
   val jumpInfos = ArrayBuffer[JumpInfo]()
   override def createJumpInterface(stage: Stage, priority : Int = 0): Flow[UInt] = {
@@ -60,10 +65,9 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
 //  var decodeExceptionPort : Flow[ExceptionCause] = null
   override def setup(pipeline: VexRiscv): Unit = {
     fetcherHalt = False
+    forceNoDecodeCond = False
     incomingInstruction = False
     if(resetVector == null) externalResetVector = in(UInt(32 bits).setName("externalResetVector"))
-
-    pipeline(RVC_GEN) = compressedGen
 
     prediction match {
       case NONE =>
@@ -182,7 +186,7 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
 
       val predictionPcLoad = ifGen(prediction == DYNAMIC_TARGET) (Flow(UInt(32 bits)))
       if(prediction == DYNAMIC_TARGET) {
-        when(predictionPcLoad.valid) {
+        when(predictionPcLoad.valid && !forceNoDecodeCond) {
           pcReg := predictionPcLoad.payload
         }
       }
@@ -255,13 +259,20 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
       val throw2Bytes = throw2BytesReg || input.pc(1)
       val unaligned = throw2Bytes || bufferValid
       def aligned = !unaligned
+
+      //Latch and patches are there to ensure that the decoded instruction do not mutate while being halted and unscheduled to ensure FpuPlugin cmd fork from consistancy
+      val bufferValidLatch = RegNextWhen(bufferValid, input.valid)
+      val throw2BytesLatch = RegNextWhen(throw2Bytes, input.valid)
+      val bufferValidPatched = input.valid ? bufferValid | bufferValidLatch
+      val throw2BytesPatched = input.valid ? throw2Bytes | throw2BytesLatch
+
       val raw = Mux(
-        sel = bufferValid,
+        sel = bufferValidPatched,
         whenTrue = input.rsp.inst(15 downto 0) ## bufferData,
-        whenFalse = input.rsp.inst(31 downto 16) ## (throw2Bytes ? input.rsp.inst(31 downto 16) | input.rsp.inst(15 downto 0))
+        whenFalse = input.rsp.inst(31 downto 16) ## (throw2BytesPatched ? input.rsp.inst(31 downto 16) | input.rsp.inst(15 downto 0))
       )
       val isRvc = raw(1 downto 0) =/= 3
-      val decompressed = RvcDecompressor(raw(15 downto 0))
+      val decompressed = RvcDecompressor(raw(15 downto 0), pipeline.config.withRvf, pipeline.config.withRvd)
       output.valid := input.valid && !(throw2Bytes && !bufferValid && !isInputHighRvc)
       output.pc := input.pc
       output.isRvc := isRvc
@@ -379,7 +390,7 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
 
           //Check if the decode instruction is driven by a register
           val instructionDriver = try {
-            decode.input(INSTRUCTION).getDrivingReg
+            decode.input(INSTRUCTION).getDrivingReg()
           } catch {
             case _: Throwable => null
           }
@@ -400,6 +411,9 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
         })
       }
 
+      Component.current.addPrePopTask(() => {
+        decode.arbitration.isValid clearWhen(forceNoDecodeCond)
+      })
 
       //Formal verification signals generation, miss prediction stuff ?
       val formal = new Area {
@@ -467,7 +481,7 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
           val branchContext = branchStage.input(PREDICTION_CONTEXT)
           val moreJump = decodePrediction.rsp.wasWrong ^ branchContext.line.history.msb
 
-          historyWrite.address := branchStage.input(PC)(2, historyRamSizeLog2 bits) + (if(pipeline(RVC_GEN))
+          historyWrite.address := branchStage.input(PC)(2, historyRamSizeLog2 bits) + (if(pipeline.config.withRvc)
             ((!branchStage.input(IS_RVC) && branchStage.input(PC)(1)) ? U(1) | U(0))
           else
             U(0))
@@ -487,7 +501,7 @@ abstract class IBusFetcherImpl(val resetVector : BigInt,
 
         decodePrediction.cmd.hadBranch := decode.input(BRANCH_CTRL) === BranchCtrlEnum.JAL || (decode.input(BRANCH_CTRL) === BranchCtrlEnum.B && conditionalBranchPrediction)
 
-        val noPredictionOnMissaligned = (!pipeline(RVC_GEN)) generate new Area{
+        val noPredictionOnMissaligned = (!pipeline.config.withRvc) generate new Area{
           val missaligned = decode.input(BRANCH_CTRL).mux(
             BranchCtrlEnum.JAL  ->  imm.j_sext(1),
             default             ->  imm.b_sext(1)
