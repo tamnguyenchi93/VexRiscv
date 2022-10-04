@@ -9,17 +9,22 @@ import spinal.lib._
 import spinal.lib.bus.amba3.apb._
 import spinal.lib.bus.amba4.axi._
 import spinal.lib.com.jtag.Jtag
+import spinal.lib.com.jtag.sim.JtagTcp
+import spinal.lib.com.uart.sim.{UartDecoder, UartEncoder}
 import spinal.lib.com.uart.{Apb3UartCtrl, Uart, UartCtrlGenerics, UartCtrlMemoryMappedConfig}
 import spinal.lib.graphic.RgbConfig
 import spinal.lib.graphic.vga.{Axi4VgaCtrl, Axi4VgaCtrlGenerics, Vga}
 import spinal.lib.io.TriStateArray
+import spinal.lib.memory.sdram.SdramGeneration.SDR
 import spinal.lib.memory.sdram._
+import spinal.lib.memory.sdram.sdr.sim.SdramModel
+import spinal.lib.memory.sdram.sdr.{Axi4SharedSdramCtrl, IS42x320D, SdramInterface, SdramTimings}
 import spinal.lib.misc.HexTools
 import spinal.lib.soc.pinsec.{PinsecTimerCtrl, PinsecTimerCtrlExternal}
 import spinal.lib.system.debugger.{JtagAxi4SharedDebugger, JtagBridge, SystemDebugger, SystemDebuggerConfig}
 
 import scala.collection.mutable.ArrayBuffer
-
+import scala.collection.Seq
 
 case class BrieyConfig(axiFrequency : HertzNumber,
                        onChipRamSize : BigInt,
@@ -145,7 +150,8 @@ object BrieyConfig{
             minstretAccess = CsrAccess.NONE,
             ecallGen       = false,
             wfiGenAsWait         = false,
-            ucycleAccess   = CsrAccess.NONE
+            ucycleAccess   = CsrAccess.NONE,
+            uinstretAccess = CsrAccess.NONE
           )
         ),
         new YamlPlugin("cpu0.yaml")
@@ -157,7 +163,7 @@ object BrieyConfig{
 
 
 
-class Briey(config: BrieyConfig) extends Component{
+class Briey(val config: BrieyConfig) extends Component{
 
   //Legacy constructor
   def this(axiFrequency: HertzNumber) {
@@ -171,9 +177,9 @@ class Briey(config: BrieyConfig) extends Component{
 
   val io = new Bundle{
     //Clocks / reset
-    val asyncReset = in Bool
-    val axiClk     = in Bool
-    val vgaClk     = in Bool
+    val asyncReset = in Bool()
+    val axiClk     = in Bool()
+    val vgaClk     = in Bool()
 
     //Main components IO
     val jtag       = slave(Jtag())
@@ -185,7 +191,7 @@ class Briey(config: BrieyConfig) extends Component{
     val uart          = master(Uart())
     val vga           = master(Vga(vgaRgbConfig))
     val timerExternal = in(PinsecTimerCtrlExternal())
-    val coreInterrupt = in Bool
+    val coreInterrupt = in Bool()
   }
 
   val resetCtrlClockDomain = ClockDomain(
@@ -197,7 +203,7 @@ class Briey(config: BrieyConfig) extends Component{
 
   val resetCtrl = new ClockingArea(resetCtrlClockDomain) {
     val systemResetUnbuffered  = False
-//    val coreResetUnbuffered = False
+    //    val coreResetUnbuffered = False
 
     //Implement an counter to keep the reset axiResetOrder high 64 cycles
     // Also this counter will automaticly do a reset when the system boot.
@@ -267,6 +273,7 @@ class Briey(config: BrieyConfig) extends Component{
 
 
     val uartCtrl = Apb3UartCtrl(uartCtrlConfig)
+    uartCtrl.io.apb.addAttribute(Verilator.public)
 
 
     val vgaCtrlConfig = Axi4VgaCtrlGenerics(
@@ -412,6 +419,7 @@ object BrieyDe0Nano{
   def main(args: Array[String]) {
     object IS42x160G {
       def layout = SdramLayout(
+        generation = SDR,
         bankWidth   = 2,
         columnWidth = 9,
         rowWidth    = 13,
@@ -439,7 +447,6 @@ object BrieyDe0Nano{
     })
   }
 }
-
 
 //DE2-115
 object BrieyDe2115{
@@ -473,6 +480,45 @@ object BrieyDe2115{
       toplevel.axi.vgaCtrl.vga.ctrl.io.frameStart.addAttribute(Verilator.public)
       toplevel
     })
+  }
+}
+
+import spinal.core.sim._
+object BrieySim {
+  def main(args: Array[String]): Unit = {
+    val simSlowDown = false
+    SimConfig.allOptimisation.compile(new Briey(BrieyConfig.default)).doSimUntilVoid{dut =>
+      val mainClkPeriod = (1e12/dut.config.axiFrequency.toDouble).toLong
+      val jtagClkPeriod = mainClkPeriod*4
+      val uartBaudRate = 115200
+      val uartBaudPeriod = (1e12/uartBaudRate).toLong
+
+      val clockDomain = ClockDomain(dut.io.axiClk, dut.io.asyncReset)
+      clockDomain.forkStimulus(mainClkPeriod)
+
+      val tcpJtag = JtagTcp(
+        jtag = dut.io.jtag,
+        jtagClkPeriod = jtagClkPeriod
+      )
+
+      val uartTx = UartDecoder(
+        uartPin = dut.io.uart.txd,
+        baudPeriod = uartBaudPeriod
+      )
+
+      val uartRx = UartEncoder(
+        uartPin = dut.io.uart.rxd,
+        baudPeriod = uartBaudPeriod
+      )
+
+      val sdram = SdramModel(
+        dut.io.sdram,
+        dut.config.sdramLayout,
+        clockDomain
+      )
+
+      dut.io.coreInterrupt #= false
+    }
   }
 }
 

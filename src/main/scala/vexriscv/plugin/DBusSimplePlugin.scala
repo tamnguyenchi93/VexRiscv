@@ -3,8 +3,10 @@ package vexriscv.plugin
 import vexriscv._
 import spinal.core._
 import spinal.lib._
+import spinal.lib.bus.amba3.ahblite.{AhbLite3Config, AhbLite3Master}
 import spinal.lib.bus.amba4.axi._
 import spinal.lib.bus.avalon.{AvalonMM, AvalonMMConfig}
+import spinal.lib.bus.bmb.{Bmb, BmbParameter}
 import spinal.lib.bus.wishbone.{Wishbone, WishboneConfig}
 import spinal.lib.bus.simple._
 import vexriscv.ip.DataCacheMemCmd
@@ -71,9 +73,21 @@ object DBusSimpleBus{
     dataWidth = 32
   )
 
+  def getAhbLite3Config() = AhbLite3Config(
+    addressWidth = 32,
+    dataWidth = 32
+  )
+  def getBmbParameter() = BmbParameter(
+    addressWidth = 32,
+    dataWidth = 32,
+    lengthWidth = 2,
+    sourceWidth = 0,
+    contextWidth = 1,
+    alignment     = BmbParameter.BurstAlignement.LENGTH
+  )
 }
 
-case class DBusSimpleBus() extends Bundle with IMasterSlave{
+case class DBusSimpleBus(bigEndian : Boolean = false) extends Bundle with IMasterSlave{
   val cmd = Stream(DBusSimpleCmd())
   val rsp = DBusSimpleRsp()
 
@@ -82,17 +96,41 @@ case class DBusSimpleBus() extends Bundle with IMasterSlave{
     slave(rsp)
   }
 
-  def toAxi4Shared(stageCmd : Boolean = true): Axi4Shared = {
+  def cmdS2mPipe() : DBusSimpleBus = {
+    val s = DBusSimpleBus(bigEndian)
+    s.cmd    << this.cmd.s2mPipe()
+    this.rsp := s.rsp
+    s
+  }
+
+  def genMask(cmd : DBusSimpleCmd) = {
+    if(bigEndian)
+      cmd.size.mux(
+        U(0) -> B"1000",
+        U(1) -> B"1100",
+        default -> B"1111"
+      ) |>> cmd.address(1 downto 0)
+    else
+      cmd.size.mux(
+        U(0) -> B"0001",
+        U(1) -> B"0011",
+        default -> B"1111"
+      ) |<< cmd.address(1 downto 0)
+  }
+
+  def toAxi4Shared(stageCmd : Boolean = false, pendingWritesMax : Int = 7): Axi4Shared = {
     val axi = Axi4Shared(DBusSimpleBus.getAxi4Config())
-    val pendingWritesMax = 7
+
+    val cmdPreFork = if (stageCmd) cmd.stage.stage().s2mPipe() else cmd
+
     val pendingWrites = CounterUpDown(
       stateCount = pendingWritesMax + 1,
-      incWhen = axi.sharedCmd.fire && axi.sharedCmd.write,
+      incWhen = cmdPreFork.fire && cmdPreFork.wr,
       decWhen = axi.writeRsp.fire
     )
 
-    val cmdPreFork = if (stageCmd) cmd.stage.stage().s2mPipe() else cmd
-    val (cmdFork, dataFork) = StreamFork2(cmdPreFork.haltWhen((pendingWrites =/= 0 && !cmdPreFork.wr) || pendingWrites === pendingWritesMax))
+    val hazard = (pendingWrites =/= 0 && cmdPreFork.valid && !cmdPreFork.wr) || pendingWrites === pendingWritesMax
+    val (cmdFork, dataFork) = StreamFork2(cmdPreFork.haltWhen(hazard))
     axi.sharedCmd.arbitrationFrom(cmdFork)
     axi.sharedCmd.write := cmdFork.wr
     axi.sharedCmd.prot := "010"
@@ -104,11 +142,7 @@ case class DBusSimpleBus() extends Bundle with IMasterSlave{
     axi.writeData.arbitrationFrom(dataStage)
     axi.writeData.last := True
     axi.writeData.data := dataStage.data
-    axi.writeData.strb := (dataStage.size.mux(
-      U(0) -> B"0001",
-      U(1) -> B"0011",
-      default -> B"1111"
-    ) << dataStage.address(1 downto 0)).resized
+    axi.writeData.strb := genMask(dataStage).resized
 
 
     rsp.ready := axi.r.valid
@@ -117,16 +151,7 @@ case class DBusSimpleBus() extends Bundle with IMasterSlave{
 
     axi.r.ready := True
     axi.b.ready := True
-
-
-    //TODO remove
-    val axi2 = Axi4Shared(DBusSimpleBus.getAxi4Config())
-    axi.arw >-> axi2.arw
-    axi.w >> axi2.w
-    axi.r << axi2.r
-    axi.b << axi2.b
-//    axi2 << axi
-    axi2
+    axi
   }
 
   def toAxi4(stageCmd : Boolean = true) = this.toAxi4Shared(stageCmd).toAxi4()
@@ -141,11 +166,7 @@ case class DBusSimpleBus() extends Bundle with IMasterSlave{
     mm.write := cmdStage.valid && cmdStage.wr
     mm.address := (cmdStage.address >> 2) @@ U"00"
     mm.writeData := cmdStage.data(31 downto 0)
-    mm.byteEnable := (cmdStage.size.mux (
-      U(0) -> B"0001",
-      U(1) -> B"0011",
-      default -> B"1111"
-    ) << cmdStage.address(1 downto 0)).resized
+    mm.byteEnable := genMask(cmdStage).resized
 
 
     cmdStage.ready := mm.waitRequestn
@@ -164,11 +185,7 @@ case class DBusSimpleBus() extends Bundle with IMasterSlave{
     bus.ADR := cmdStage.address >> 2
     bus.CTI :=B"000"
     bus.BTE := "00"
-    bus.SEL := (cmdStage.size.mux (
-      U(0) -> B"0001",
-      U(1) -> B"0011",
-      default -> B"1111"
-    ) << cmdStage.address(1 downto 0)).resized
+    bus.SEL := genMask(cmdStage).resized
     when(!cmdStage.wr) {
       bus.SEL := "1111"
     }
@@ -192,15 +209,66 @@ case class DBusSimpleBus() extends Bundle with IMasterSlave{
     bus.cmd.write := cmd.wr
     bus.cmd.address := cmd.address.resized
     bus.cmd.data := cmd.data
-    bus.cmd.mask := cmd.size.mux(
-      0 -> B"0001",
-      1 -> B"0011",
-      default -> B"1111"
-    ) |<< cmd.address(1 downto 0)
+    bus.cmd.mask := genMask(cmd)
     cmd.ready := bus.cmd.ready
 
     rsp.ready := bus.rsp.valid
     rsp.data := bus.rsp.data
+
+    bus
+  }
+
+  def toAhbLite3Master(avoidWriteToReadHazard : Boolean): AhbLite3Master = {
+    val bus = AhbLite3Master(DBusSimpleBus.getAhbLite3Config())
+    bus.HADDR     := this.cmd.address
+    bus.HWRITE    := this.cmd.wr
+    bus.HSIZE     := B(this.cmd.size, 3 bits)
+    bus.HBURST    := 0
+    bus.HPROT     := "1111"
+    bus.HTRANS    := this.cmd.valid ## B"0"
+    bus.HMASTLOCK := False
+    bus.HWDATA    := RegNextWhen(this.cmd.data, bus.HREADY)
+    this.cmd.ready := bus.HREADY
+
+    val pending = RegInit(False) clearWhen(bus.HREADY) setWhen(this.cmd.fire && !this.cmd.wr)
+    this.rsp.ready := bus.HREADY && pending
+    this.rsp.data := bus.HRDATA
+    this.rsp.error := bus.HRESP
+
+    if(avoidWriteToReadHazard) {
+      val writeDataPhase = RegNextWhen(bus.HTRANS === 2 && bus.HWRITE, bus.HREADY) init (False)
+      val potentialHazard = this.cmd.valid && !this.cmd.wr && writeDataPhase
+      when(potentialHazard) {
+        bus.HTRANS := 0
+        this.cmd.ready := False
+      }
+    }
+    bus
+  }
+  
+  def toBmb() : Bmb = {
+    val pipelinedMemoryBusConfig = DBusSimpleBus.getBmbParameter()
+    val bus = Bmb(pipelinedMemoryBusConfig)
+
+    bus.cmd.valid := cmd.valid
+    bus.cmd.last := True
+    bus.cmd.context(0) := cmd.wr
+    bus.cmd.opcode := (cmd.wr ? B(Bmb.Cmd.Opcode.WRITE) | B(Bmb.Cmd.Opcode.READ))
+    bus.cmd.address := cmd.address.resized
+    bus.cmd.data := cmd.data
+    bus.cmd.length := cmd.size.mux(
+      0       -> U"00",
+      1       -> U"01",
+      default -> U"11"
+    )
+    bus.cmd.mask := genMask(cmd)
+
+    cmd.ready := bus.cmd.ready
+
+    rsp.ready := bus.rsp.valid && !bus.rsp.context(0)
+    rsp.data  := bus.rsp.data
+    rsp.error := bus.rsp.isError
+    bus.rsp.ready := True
 
     bus
   }
@@ -213,6 +281,7 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
                        emitCmdInMemoryStage : Boolean = false,
                        onlyLoadWords : Boolean = false,
                        withLrSc : Boolean = false,
+                       val bigEndian : Boolean = false,
                        memoryTranslatorPortConfig : Any = null) extends Plugin[VexRiscv] with DBusAccessService {
 
   var dBus  : DBusSimpleBus = null
@@ -222,7 +291,6 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
   object MEMORY_ADDRESS_LOW extends Stageable(UInt(2 bits))
   object ALIGNEMENT_FAULT extends Stageable(Bool)
   object MMU_FAULT extends Stageable(Bool)
-  object MMU_RSP extends Stageable(MemoryTranslatorRsp())
   object MEMORY_ATOMIC extends Stageable(Bool)
   object ATOMIC_HIT extends Stageable(Bool)
   object MEMORY_STORE extends Stageable(Bool)
@@ -259,13 +327,15 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
       REGFILE_WRITE_VALID -> True,
       BYPASSABLE_EXECUTE_STAGE -> False,
       BYPASSABLE_MEMORY_STAGE  -> Bool(earlyInjection),
-      MEMORY_STORE -> False
-    ) ++ (if(catchAccessFault || catchAddressMisaligned) List(HAS_SIDE_EFFECT -> True) else Nil)
+      MEMORY_STORE -> False,
+      HAS_SIDE_EFFECT -> True
+    )
 
     val storeActions = stdActions ++ List(
       SRC2_CTRL -> Src2CtrlEnum.IMS,
       RS2_USE -> True,
-      MEMORY_STORE -> True
+      MEMORY_STORE -> True,
+      HAS_SIDE_EFFECT -> True
     )
 
     decoderService.addDefault(MEMORY_ENABLE, False)
@@ -317,7 +387,9 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
     import pipeline._
     import pipeline.config._
 
-    dBus = master(DBusSimpleBus()).setName("dBus")
+    object MMU_RSP extends Stageable(MemoryTranslatorRsp(mmuBus.p))
+
+    dBus = master(DBusSimpleBus(bigEndian)).setName("dBus")
 
 
     decode plug new Area {
@@ -360,11 +432,7 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
       insert(MEMORY_ADDRESS_LOW) := dBus.cmd.address(1 downto 0)
 
       //formal
-      val formalMask = dBus.cmd.size.mux(
-        U(0) -> B"0001",
-        U(1) -> B"0011",
-        default -> B"1111"
-      ) |<< dBus.cmd.address(1 downto 0)
+      val formalMask = dBus.genMask(dBus.cmd)
 
       insert(FORMAL_MEM_ADDR) := dBus.cmd.address & U"xFFFFFFFC"
       insert(FORMAL_MEM_WMASK) := (dBus.cmd.valid &&  dBus.cmd.wr) ? formalMask | B"0000"
@@ -372,9 +440,10 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
       insert(FORMAL_MEM_WDATA) := dBus.cmd.payload.data
 
       val mmu = (mmuBus != null) generate new Area {
-        mmuBus.cmd.isValid := arbitration.isValid && input(MEMORY_ENABLE)
-        mmuBus.cmd.virtualAddress := input(SRC_ADD).asUInt
-        mmuBus.cmd.bypassTranslation := False
+        mmuBus.cmd.last.isValid := arbitration.isValid && input(MEMORY_ENABLE)
+        mmuBus.cmd.last.isStuck := arbitration.isStuck
+        mmuBus.cmd.last.virtualAddress := input(SRC_ADD).asUInt
+        mmuBus.cmd.last.bypassTranslation := False
         mmuBus.end := !arbitration.isStuck || arbitration.isRemoved
         dBus.cmd.address := mmuBus.rsp.physicalAddress
 
@@ -393,13 +462,10 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
       val atomic = withLrSc generate new Area{
         val reserved = RegInit(False)
         insert(ATOMIC_HIT) := reserved
-        when(arbitration.isFiring &&  input(MEMORY_ENABLE) && input(MEMORY_ATOMIC) && !input(MEMORY_STORE)){
-          reserved := True
+        when(arbitration.isFiring &&  input(MEMORY_ENABLE) && (if(mmuBus != null) !input(MMU_FAULT) else True) && !skipCmd){
+          reserved setWhen(input(MEMORY_ATOMIC))
+          reserved clearWhen(input(MEMORY_STORE))
         }
-        when(service(classOf[IContextSwitching]).isContextSwitching){
-          reserved := False
-        }
-
         when(input(MEMORY_STORE) && input(MEMORY_ATOMIC) && !input(ATOMIC_HIT)){
           skipCmd := True
         }
@@ -442,7 +508,8 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
             memoryExceptionPort.code := (input(MEMORY_STORE) ? U(15) | U(13)).resized
           }
 
-          arbitration.flushAll setWhen(redoBranch.valid)
+          arbitration.flushIt setWhen(redoBranch.valid)
+          arbitration.flushNext setWhen(redoBranch.valid)
         }
 
         when(!(arbitration.isValid && input(MEMORY_ENABLE) && (Bool(cmdStage != rspStage) || !arbitration.isStuckByOthers))){
@@ -451,9 +518,6 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
         }
 
       }
-
-
-      if(rspStage != execute) assert(!(dBus.rsp.ready && input(MEMORY_ENABLE) && arbitration.isValid && arbitration.isStuck),"DBusSimplePlugin doesn't allow memory stage stall when read happend")
     }
 
     //Reformat read responses, REGFILE_WRITE_DATA overriding
@@ -464,17 +528,32 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
 
       val rspShifted = MEMORY_READ_DATA()
       rspShifted := input(MEMORY_READ_DATA)
-      switch(input(MEMORY_ADDRESS_LOW)){
-        is(1){rspShifted(7 downto 0) := input(MEMORY_READ_DATA)(15 downto 8)}
-        is(2){rspShifted(15 downto 0) := input(MEMORY_READ_DATA)(31 downto 16)}
-        is(3){rspShifted(7 downto 0) := input(MEMORY_READ_DATA)(31 downto 24)}
-      }
+      if(bigEndian)
+        switch(input(MEMORY_ADDRESS_LOW)){
+          is(1){rspShifted(31 downto 24) := input(MEMORY_READ_DATA)(23 downto 16)}
+          is(2){rspShifted(31 downto 16) := input(MEMORY_READ_DATA)(15 downto 0)}
+          is(3){rspShifted(31 downto 24) := input(MEMORY_READ_DATA)(7 downto 0)}
+        }
+      else
+        switch(input(MEMORY_ADDRESS_LOW)){
+          is(1){rspShifted(7 downto 0) := input(MEMORY_READ_DATA)(15 downto 8)}
+          is(2){rspShifted(15 downto 0) := input(MEMORY_READ_DATA)(31 downto 16)}
+          is(3){rspShifted(7 downto 0) := input(MEMORY_READ_DATA)(31 downto 24)}
+        }
 
-      val rspFormated = input(INSTRUCTION)(13 downto 12).mux(
-        0 -> B((31 downto 8) -> (rspShifted(7) && !input(INSTRUCTION)(14)),(7 downto 0) -> rspShifted(7 downto 0)),
-        1 -> B((31 downto 16) -> (rspShifted(15) && ! input(INSTRUCTION)(14)),(15 downto 0) -> rspShifted(15 downto 0)),
-        default -> rspShifted //W
-      )
+      val rspFormated =
+        if(bigEndian)
+          input(INSTRUCTION)(13 downto 12).mux(
+                0 -> B((31 downto 8) -> (rspShifted(31) && !input(INSTRUCTION)(14)),(7 downto 0) -> rspShifted(31 downto 24)),
+                1 -> B((31 downto 16) -> (rspShifted(31) && ! input(INSTRUCTION)(14)),(15 downto 0) -> rspShifted(31 downto 16)),
+                default -> rspShifted //W
+          )
+        else
+          input(INSTRUCTION)(13 downto 12).mux(
+                0 -> B((31 downto 8) -> (rspShifted(7) && !input(INSTRUCTION)(14)),(7 downto 0) -> rspShifted(7 downto 0)),
+                1 -> B((31 downto 16) -> (rspShifted(15) && ! input(INSTRUCTION)(14)),(15 downto 0) -> rspShifted(15 downto 0)),
+                default -> rspShifted //W
+          )
 
       when(arbitration.isValid && input(MEMORY_ENABLE)) {
         output(REGFILE_WRITE_DATA) := (if(!onlyLoadWords) rspFormated else input(MEMORY_READ_DATA))
@@ -485,8 +564,8 @@ class DBusSimplePlugin(catchAddressMisaligned : Boolean = false,
         }
       }
 
-      if(!earlyInjection && !emitCmdInMemoryStage && config.withWriteBackStage)
-        assert(!(arbitration.isValid && input(MEMORY_ENABLE) && !input(MEMORY_STORE) && arbitration.isStuck),"DBusSimplePlugin doesn't allow writeback stage stall when read happend")
+//      if(!earlyInjection && !emitCmdInMemoryStage && config.withWriteBackStage)
+//        assert(!(arbitration.isValid && input(MEMORY_ENABLE) && !input(MEMORY_STORE) && arbitration.isStuck),"DBusSimplePlugin doesn't allow writeback stage stall when read happend")
 
       //formal
       insert(FORMAL_MEM_RDATA) := input(MEMORY_READ_DATA)

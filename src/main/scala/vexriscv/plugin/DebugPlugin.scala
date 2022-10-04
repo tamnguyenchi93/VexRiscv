@@ -1,14 +1,17 @@
 package vexriscv.plugin
 
-import spinal.lib.com.jtag.Jtag
-import spinal.lib.system.debugger.{JtagBridge, SystemDebugger, SystemDebuggerConfig}
+import spinal.lib.com.jtag.{Jtag, JtagTapInstructionCtrl}
+import spinal.lib.system.debugger.{JtagBridge, JtagBridgeNoTap, SystemDebugger, SystemDebuggerConfig, SystemDebuggerMemBus}
 import vexriscv.plugin.IntAluPlugin.{ALU_CTRL, AluCtrlEnum}
 import vexriscv._
 import vexriscv.ip._
 import spinal.core._
 import spinal.lib._
+import spinal.lib.blackbox.xilinx.s7.BSCANE2
 import spinal.lib.bus.amba3.apb.{Apb3, Apb3Config}
 import spinal.lib.bus.avalon.{AvalonMM, AvalonMMConfig}
+import spinal.lib.bus.bmb.{Bmb, BmbAccessCapabilities, BmbAccessParameter, BmbParameter}
+import spinal.lib.bus.simple.PipelinedMemoryBus
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -20,6 +23,15 @@ case class DebugExtensionCmd() extends Bundle{
 }
 case class DebugExtensionRsp() extends Bundle{
   val data = Bits(32 bit)
+}
+
+object DebugExtensionBus{
+  def getBmbAccessParameter(source : BmbAccessCapabilities) = source.copy(
+    addressWidth = 8,
+    dataWidth    = 32,
+    lengthWidthMax  = 2,
+    alignment = BmbParameter.BurstAlignement.LENGTH
+  )
 }
 
 case class DebugExtensionBus() extends Bundle with IMasterSlave{
@@ -63,6 +75,54 @@ case class DebugExtensionBus() extends Bundle with IMasterSlave{
     bus
   }
 
+  def fromPipelinedMemoryBus(): PipelinedMemoryBus ={
+    val bus = PipelinedMemoryBus(32, 32)
+
+    cmd.arbitrationFrom(bus.cmd)
+    cmd.wr := bus.cmd.write
+    cmd.address := bus.cmd.address.resized
+    cmd.data := bus.cmd.data
+
+    bus.rsp.valid := RegNext(cmd.fire) init(False)
+    bus.rsp.data := rsp.data
+
+    bus
+  }
+
+  def fromBmb(): Bmb ={
+    val bus = Bmb(BmbParameter(
+      addressWidth  = 8,
+      dataWidth     = 32,
+      lengthWidth   = 2,
+      sourceWidth   = 0,
+      contextWidth  = 0
+    ))
+
+    cmd.arbitrationFrom(bus.cmd)
+    cmd.wr := bus.cmd.isWrite
+    cmd.address := bus.cmd.address
+    cmd.data := bus.cmd.data
+
+    bus.rsp.valid := RegNext(cmd.fire) init(False)
+    bus.rsp.data := rsp.data
+    bus.rsp.last := True
+    bus.rsp.setSuccess()
+
+    bus
+  }
+
+  def from(c : SystemDebuggerConfig) : SystemDebuggerMemBus = {
+    val mem = SystemDebuggerMemBus(c)
+    cmd.valid          := mem.cmd.valid
+    cmd.wr             := mem.cmd.wr
+    cmd.data           := mem.cmd.data
+    cmd.address        := mem.cmd.address.resized
+    mem.cmd.ready      := cmd.ready
+    mem.rsp.valid      := RegNext(cmd.fire).init(False)
+    mem.rsp.payload    := rsp.data
+    mem
+  }
+
   def fromJtag(): Jtag ={
     val jtagConfig = SystemDebuggerConfig(
       memAddressWidth = 32,
@@ -72,15 +132,37 @@ case class DebugExtensionBus() extends Bundle with IMasterSlave{
     val jtagBridge = new JtagBridge(jtagConfig)
     val debugger = new SystemDebugger(jtagConfig)
     debugger.io.remote <> jtagBridge.io.remote
-    debugger.io.mem.cmd.valid           <> cmd.valid
-    debugger.io.mem.cmd.ready           <> cmd.ready
-    debugger.io.mem.cmd.wr              <> cmd.wr
-    cmd.address := debugger.io.mem.cmd.address.resized
-    debugger.io.mem.cmd.data            <> cmd.data
-    debugger.io.mem.rsp.valid           <> RegNext(cmd.fire).init(False)
-    debugger.io.mem.rsp.payload         <> rsp.data
+    debugger.io.mem <> this.from(jtagConfig)
 
     jtagBridge.io.jtag
+  }
+
+  def fromJtagInstructionCtrl(jtagClockDomain : ClockDomain, jtagHeaderIgnoreWidth : Int): JtagTapInstructionCtrl ={
+    val jtagConfig = SystemDebuggerConfig(
+      memAddressWidth = 32,
+      memDataWidth    = 32,
+      remoteCmdWidth  = 1
+    )
+    val jtagBridge = new JtagBridgeNoTap(jtagConfig, jtagClockDomain, jtagHeaderIgnoreWidth)
+    val debugger = new SystemDebugger(jtagConfig)
+    debugger.io.remote <> jtagBridge.io.remote
+    debugger.io.mem <> this.from(jtagConfig)
+
+    jtagBridge.io.ctrl
+  }
+
+  def fromBscane2(usedId : Int, jtagHeaderIgnoreWidth : Int): Unit ={
+    val jtagConfig = SystemDebuggerConfig()
+
+    val bscane2 = BSCANE2(usedId)
+    val jtagClockDomain = ClockDomain(bscane2.TCK)
+
+    val jtagBridge = new JtagBridgeNoTap(jtagConfig, jtagClockDomain, jtagHeaderIgnoreWidth)
+    jtagBridge.io.ctrl << bscane2.toJtagTapInstructionCtrl()
+
+    val debugger = new SystemDebugger(jtagConfig)
+    debugger.io.remote <> jtagBridge.io.remote
+    debugger.io.mem <> this.from(debugger.io.mem.c)
   }
 }
 
@@ -94,9 +176,7 @@ case class DebugExtensionIo() extends Bundle with IMasterSlave{
   }
 }
 
-
-
-class DebugPlugin(val debugClockDomain : ClockDomain, hardwareBreakpointCount : Int = 0) extends Plugin[VexRiscv] {
+class DebugPlugin(var debugClockDomain : ClockDomain, hardwareBreakpointCount : Int = 0, BreakpointReadback : Boolean = false) extends Plugin[VexRiscv] {
 
   var io : DebugExtensionIo = null
   val injectionAsks = ArrayBuffer[(Stage, Bool)]()
@@ -144,6 +224,10 @@ class DebugPlugin(val debugClockDomain : ClockDomain, hardwareBreakpointCount : 
       val isPipBusy = RegNext(stages.map(_.arbitration.isValid).orR || iBusFetcher.incoming())
       val godmode = RegInit(False) setWhen(haltIt && !isPipBusy)
       val haltedByBreak = RegInit(False)
+      val debugUsed = RegInit(False) setWhen(io.bus.cmd.valid) addAttribute(Verilator.public)
+      val disableEbreak = RegInit(False)
+
+      val allowEBreak = debugUsed && !disableEbreak
 
       val hardwareBreakpoints = Vec(Reg(new Bundle{
         val valid = Bool()
@@ -164,6 +248,17 @@ class DebugPlugin(val debugClockDomain : ClockDomain, hardwareBreakpointCount : 
         io.bus.rsp.data(3) := haltedByBreak
         io.bus.rsp.data(4) := stepIt
       }
+      if (BreakpointReadback) {
+        switch(RegNext(io.bus.cmd.address(7 downto 2))) {
+          for(i <- 0 until hardwareBreakpointCount){
+            is(0x10 + i){
+              io.bus.rsp.data(31 downto 1) := hardwareBreakpoints(i).pc.asBits
+              io.bus.rsp.data(0)           := hardwareBreakpoints(i).valid
+            }
+          }
+        }
+      }
+
 
       injectionPort.valid := False
       injectionPort.payload := io.bus.cmd.data
@@ -177,6 +272,7 @@ class DebugPlugin(val debugClockDomain : ClockDomain, hardwareBreakpointCount : 
               haltIt setWhen (io.bus.cmd.data(17)) clearWhen (io.bus.cmd.data(25))
               haltedByBreak clearWhen (io.bus.cmd.data(25))
               godmode clearWhen(io.bus.cmd.data(25))
+              disableEbreak setWhen (io.bus.cmd.data(18)) clearWhen (io.bus.cmd.data(26))
             }
           }
           is(0x1) {
@@ -195,15 +291,14 @@ class DebugPlugin(val debugClockDomain : ClockDomain, hardwareBreakpointCount : 
         }
       }
 
-
-      decode.insert(DO_EBREAK) := !haltIt && (decode.input(IS_EBREAK) || hardwareBreakpoints.map(hb => hb.valid && hb.pc === (decode.input(PC) >> 1)).foldLeft(False)(_ || _))
+      decode.insert(DO_EBREAK) := !haltIt && (decode.input(IS_EBREAK) || hardwareBreakpoints.map(hb => hb.valid && hb.pc === (decode.input(PC) >> 1)).foldLeft(False)(_ || _)) && allowEBreak
       when(execute.arbitration.isValid && execute.input(DO_EBREAK)){
         execute.arbitration.haltByOther := True
         busReadDataReg := execute.input(PC).asBits
         when(stagesFromExecute.tail.map(_.arbitration.isValid).orR === False){
-          iBusFetcher.flushIt()
           iBusFetcher.haltIt()
-          execute.arbitration.flushAll := True
+          execute.arbitration.flushIt   := True
+          execute.arbitration.flushNext := True
           haltIt := True
           haltedByBreak := True
         }
@@ -221,9 +316,13 @@ class DebugPlugin(val debugClockDomain : ClockDomain, hardwareBreakpointCount : 
       }
 
       //Avoid having two C instruction executed in a single step
-      if(pipeline(RVC_GEN)){
+      if(pipeline.config.withRvc){
         val cleanStep = RegNext(stepIt && decode.arbitration.isFiring) init(False)
-        decode.arbitration.removeIt setWhen(cleanStep)
+        execute.arbitration.flushNext setWhen(cleanStep)
+        when(cleanStep){
+          execute.arbitration.flushNext := True
+          iBusFetcher.forceNoDecode()
+        }
       }
 
       io.resetOut := RegNext(resetIt)
@@ -243,7 +342,22 @@ class DebugPlugin(val debugClockDomain : ClockDomain, hardwareBreakpointCount : 
           case p : PrivilegeService => p.forceMachine()
           case _ =>
         }
+        pipeline.plugins.foreach{
+          case p : PredictionInterface => p.inDebugNoFetch()
+          case _ =>
+        }
         if(pipeline.things.contains(DEBUG_BYPASS_CACHE)) pipeline(DEBUG_BYPASS_CACHE) := True
+      }
+      when(allowEBreak) {
+        pipeline.plugins.foreach {
+          case p: ExceptionInhibitor => p.inhibateEbreakException()
+          case _ =>
+        }
+      }
+
+      val wakeService = serviceElse(classOf[IWake], null)
+      if(wakeService != null) when(haltIt){
+        wakeService.askWake()
       }
     }}
   }

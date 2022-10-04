@@ -1,19 +1,29 @@
 DEBUG?=no
-
+REGRESSION_PATH?=./
+VEXRISCV_FILE?=../../../../VexRiscv.v
 IBUS?=CACHED
 IBUS_TC?=no
+IBUS_DATA_WIDTH?=32
 DBUS?=CACHED
+DBUS_LOAD_DATA_WIDTH?=32
+DBUS_STORE_DATA_WIDTH?=32
 TRACE?=no
 TRACE_ACCESS?=no
 TRACE_START=0
+TRACE_SPORADIC?=no
 ISA_TEST?=yes
 MUL?=yes
 DIV?=yes
+RVF?=no
+RVD?=no
 CSR?=yes
 CSR_SKIP_TEST?=no
 EBREAK?=no
 FENCEI?=no
 MMU?=yes
+DBUS_EXCLUSIVE?=no
+DBUS_INVALIDATE?=no
+PMP?=no
 SEED?=no
 LRSC?=no
 AMO?=no
@@ -21,6 +31,7 @@ NO_STALL?=no
 DEBUG_PLUGIN?=STD
 DEBUG_PLUGIN_EXTERNAL?=no
 RUN_HEX=no
+WITH_RISCV_REF=yes
 CUSTOM_SIMD_ADD?=no
 CUSTOM_CSR?=no
 DHRYSTONE=yes
@@ -38,10 +49,19 @@ STOP_ON_ERROR?=no
 COREMARK=no
 WITH_USER_IO?=no
 
+
+ADDCFLAGS += -CFLAGS -DREGRESSION_PATH='\"$(REGRESSION_PATH)/\"'
 ADDCFLAGS += -CFLAGS -DIBUS_${IBUS}
+ADDCFLAGS += -CFLAGS -DIBUS_DATA_WIDTH=${IBUS_DATA_WIDTH}
+ADDCFLAGS += -CFLAGS -DDBUS_LOAD_DATA_WIDTH=${DBUS_LOAD_DATA_WIDTH}
+ADDCFLAGS += -CFLAGS -DDBUS_STORE_DATA_WIDTH=${DBUS_STORE_DATA_WIDTH}
+
 ADDCFLAGS += -CFLAGS -DDBUS_${DBUS}
 ADDCFLAGS += -CFLAGS -DREDO=${REDO}
 ADDCFLAGS += -CFLAGS -pthread
+ADDCFLAGS += -CFLAGS -Wno-unused-result
+
+
 
 ADDCFLAGS += -CFLAGS -DTHREAD_COUNT=${THREAD_COUNT}
 
@@ -51,7 +71,9 @@ else
 	ADDCFLAGS += -CFLAGS -O3  -O3
 endif
 
-
+ifeq ($(CONCURRENT_OS_EXECUTIONS),yes)
+	ADDCFLAGS += -CFLAGS -DCONCURRENT_OS_EXECUTIONS
+endif
 
 ifeq ($(LITEX),yes)
 	ADDCFLAGS += -CFLAGS -DLITEX
@@ -68,6 +90,15 @@ ifeq ($(LINUX_SOC),yes)
 	ADDCFLAGS += -CFLAGS -DRAMDISK='\"$(RAMDISK)\"'
 	ADDCFLAGS += -CFLAGS -DEMULATOR='\"$(EMULATOR)\"'
 endif
+
+ifeq ($(LINUX_SOC_SMP),yes)
+	ADDCFLAGS += -CFLAGS -DLINUX_SOC_SMP
+	ADDCFLAGS += -CFLAGS -DVMLINUX='\"$(VMLINUX)\"'
+	ADDCFLAGS += -CFLAGS -DDTB='\"$(DTB)\"'
+	ADDCFLAGS += -CFLAGS -DRAMDISK='\"$(RAMDISK)\"'
+	ADDCFLAGS += -CFLAGS -DEMULATOR='\"$(EMULATOR)\"'
+endif
+
 
 ARCH_LINUX=rv32i
 ifeq ($(MUL),yes)
@@ -103,15 +134,30 @@ ifeq ($(COREMARK),yes)
 	ADDCFLAGS += -CFLAGS -DCOREMARK
 endif
 
+ifeq ($(WITH_RISCV_REF),yes)
+	ADDCFLAGS += -CFLAGS -DWITH_RISCV_REF
+endif
 
 
-ifneq ($(shell grep timerInterrupt ../../../../VexRiscv.v -w),)
+
+ifneq ($(shell grep timerInterrupt ${VEXRISCV_FILE} -w),)
     ADDCFLAGS += -CFLAGS -DTIMER_INTERRUPT
 endif
 
-ifneq ($(shell grep externalInterrupt ../../../../VexRiscv.v -w),)
+ifneq ($(shell grep externalInterrupt ${VEXRISCV_FILE} -w),)
+ifneq ($(EXTERNAL_INTERRUPT),no)
     ADDCFLAGS += -CFLAGS -DEXTERNAL_INTERRUPT
 endif
+endif
+
+ifneq ($(shell grep utime ${VEXRISCV_FILE} -w),)
+    ADDCFLAGS += -CFLAGS -DUTIME_INPUT
+endif
+
+ifneq ($(shell grep dBus_rsp_payload_aggregated ${VEXRISCV_FILE} -w),)
+    ADDCFLAGS += -CFLAGS -DDBUS_AGGREGATION
+endif
+
 
 ifneq ($(RUN_HEX),no)
 	ADDCFLAGS += -CFLAGS -DRUN_HEX='\"$(RUN_HEX)\"'
@@ -164,11 +210,16 @@ ifneq ($(SEED),no)
 	ADDCFLAGS += -CFLAGS -DSEED=${SEED}
 endif
 
-
 ifeq ($(TRACE),yes)
-	VERILATOR_ARGS += --trace
+	VERILATOR_ARGS += --trace-fst
 	ADDCFLAGS += -CFLAGS -DTRACE
 endif
+
+ifeq ($(TRACE_SPORADIC),yes)
+	ADDCFLAGS += -CFLAGS -DTRACE_SPORADIC
+endif
+
+
 
 ifeq ($(CSR),yes)
 	ADDCFLAGS += -CFLAGS -DCSR
@@ -211,8 +262,27 @@ ifeq ($(MMU),yes)
 	ADDCFLAGS += -CFLAGS -DMMU
 endif
 
+ifeq ($(DBUS_EXCLUSIVE),yes)
+	ADDCFLAGS += -CFLAGS -DDBUS_EXCLUSIVE
+endif
+ifeq ($(DBUS_INVALIDATE),yes)
+	ADDCFLAGS += -CFLAGS -DDBUS_INVALIDATE
+endif
+
+ifeq ($(PMP),yes)
+	ADDCFLAGS += -CFLAGS -DPMP
+endif
+
 ifeq ($(MUL),yes)
 	ADDCFLAGS += -CFLAGS -DMUL
+endif
+
+ifeq ($(RVF),yes)
+	ADDCFLAGS += -CFLAGS -DRVF
+endif
+
+ifeq ($(RVD),yes)
+	ADDCFLAGS += -CFLAGS -DRVD
 endif
 
 ifeq ($(DIV),yes)
@@ -263,15 +333,13 @@ all: clean run
 run: compile
 	./obj_dir/VVexRiscv
 
-verilate: ../../../../VexRiscv.v
-	rm -f VexRiscv.v*.bin
-	cp ../../../../VexRiscv.v*.bin . | true
-	verilator -cc  ../../../../VexRiscv.v  -O3 -CFLAGS -std=c++11 -LDFLAGS -pthread  ${ADDCFLAGS} --gdbbt ${VERILATOR_ARGS} -Wno-UNOPTFLAT -Wno-WIDTH --x-assign unique --exe main.cpp
+verilate: ${VEXRISCV_FILE}
+	cp ${VEXRISCV_FILE}*.bin . | true
+	verilator -cc  ${VEXRISCV_FILE}  -O3 -CFLAGS -std=c++11 -LDFLAGS -pthread  ${ADDCFLAGS} --gdbbt ${VERILATOR_ARGS} -Wno-UNOPTFLAT -Wno-WIDTH --x-assign unique --exe main.cpp
  	
 compile: verilate
 	make  -j${THREAD_COUNT} -C obj_dir/ -f VVexRiscv.mk VVexRiscv
  	
 clean:
 	rm -rf obj_dir
-	rm -f VexRiscv.v*.bin
  	

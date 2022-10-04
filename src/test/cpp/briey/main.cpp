@@ -6,7 +6,6 @@
 #include "VBriey_RiscvCore.h"
 #endif
 #include "verilated.h"
-#include "verilated_vcd_c.h"
 #include <stdio.h>
 #include <iostream>
 #include <stdlib.h>
@@ -383,6 +382,8 @@ public:
 		timeProcesses.push_back(asyncReset);
 		timeProcesses.push_back(jtag);
 		timeProcesses.push_back(uartRx);
+        top->io_uart_rxd = 1;
+
 
 		SdramConfig *sdramConfig = new SdramConfig(
 			2,  //byteCount
@@ -401,7 +402,7 @@ public:
 		sdramIo->ADDR            = &top->io_sdram_ADDR           ;
 		sdramIo->DQ_read         = (CData*)&top->io_sdram_DQ_read        ;
 		sdramIo->DQ_write        = (CData*)&top->io_sdram_DQ_write       ;
-		sdramIo->DQ_writeEnable = &top->io_sdram_DQ_writeEnable;
+		sdramIo->DQ_writeEnable = (CData*)&top->io_sdram_DQ_writeEnable;
 		Sdram *sdram = new Sdram(sdramConfig, sdramIo);
 
 		axiClk->add(sdram);
@@ -465,8 +466,6 @@ int main(int argc, char **argv, char **env) {
 
 	uint64_t duration = timer_end(startedAt);
 	cout << endl << "****************************************************************" << endl;
-	cout << "Had simulate " << workspaceCycles << " clock cycles in " << duration*1e-9 << " s (" << workspaceCycles / (duration*1e-9) << " Khz)" << endl;
-	cout << "****************************************************************" << endl << endl;
 
 
 	exit(0);

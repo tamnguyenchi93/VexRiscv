@@ -4,6 +4,7 @@ import vexriscv.plugin._
 import spinal.core._
 
 import scala.collection.mutable.ArrayBuffer
+import scala.collection.Seq
 
 object VexRiscvConfig{
   def apply(withMemoryStage : Boolean, withWriteBackStage : Boolean, plugins : Seq[Plugin[VexRiscv]]): VexRiscvConfig = {
@@ -16,13 +17,41 @@ object VexRiscvConfig{
 
   def apply(plugins : Seq[Plugin[VexRiscv]] = ArrayBuffer()) : VexRiscvConfig = apply(true,true,plugins)
 }
-
+trait VexRiscvRegressionArg{
+  def getVexRiscvRegressionArgs() : Seq[String]
+}
 case class VexRiscvConfig(){
   var withMemoryStage = true
   var withWriteBackStage = true
   val plugins = ArrayBuffer[Plugin[VexRiscv]]()
 
   def add(that : Plugin[VexRiscv]) : this.type = {plugins += that;this}
+  def find[T](clazz: Class[T]): Option[T] = {
+    plugins.find(_.getClass == clazz) match {
+      case Some(x) => Some(x.asInstanceOf[T])
+      case None => None
+    }
+  }
+  def get[T](clazz: Class[T]): T = {
+    plugins.find(_.getClass == clazz) match {
+      case Some(x) => x.asInstanceOf[T]
+    }
+  }
+
+  def withRvc = plugins.find(_.isInstanceOf[IBusFetcher]) match {
+    case Some(x) => x.asInstanceOf[IBusFetcher].withRvc
+    case None => false
+  }
+
+  def withRvf = find(classOf[FpuPlugin]) match {
+    case Some(x) => true
+    case None => false
+  }
+
+  def withRvd = find(classOf[FpuPlugin]) match {
+    case Some(x) => x.p.withDouble
+    case None => false
+  }
 
   //Default Stageables
   object IS_RVC extends Stageable(Bool)
@@ -36,7 +65,6 @@ case class VexRiscvConfig(){
   object PC extends Stageable(UInt(32 bits))
   object PC_CALC_WITHOUT_JUMP extends Stageable(UInt(32 bits))
   object INSTRUCTION extends Stageable(Bits(32 bits))
-  object INSTRUCTION_READY extends Stageable(Bool)
   object INSTRUCTION_ANTICIPATED extends Stageable(Bits(32 bits))
   object LEGAL_INSTRUCTION extends Stageable(Bool)
   object REGFILE_WRITE_VALID extends Stageable(Bool)
@@ -78,11 +106,20 @@ case class VexRiscvConfig(){
   }
   object SRC1_CTRL  extends Stageable(Src1CtrlEnum())
   object SRC2_CTRL  extends Stageable(Src2CtrlEnum())
+
+  def getRegressionArgs() : Seq[String] = {
+    val str = ArrayBuffer[String]()
+    plugins.foreach{
+      case e : VexRiscvRegressionArg => str ++= e.getVexRiscvRegressionArgs()
+      case _ =>
+    }
+    str
+  }
 }
 
 
 
-object RVC_GEN extends PipelineThing[Boolean]
+
 class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   type  T = VexRiscv
   import config._
@@ -99,19 +136,17 @@ class VexRiscv(val config : VexRiscvConfig) extends Component with Pipeline{
   plugins ++= config.plugins
 
   //regression usage
-  val lastStageInstruction = CombInit(stages.last.input(config.INSTRUCTION)) keep() addAttribute (Verilator.public)
-  val lastStagePc = CombInit(stages.last.input(config.PC)) keep() addAttribute (Verilator.public)
-  val lastStageIsValid = CombInit(stages.last.arbitration.isValid) keep() addAttribute (Verilator.public)
-  val lastStageIsFiring = CombInit(stages.last.arbitration.isFiring) keep() addAttribute (Verilator.public)
+  val lastStageInstruction = CombInit(stages.last.input(config.INSTRUCTION)).dontSimplifyIt().addAttribute (Verilator.public)
+  val lastStagePc = CombInit(stages.last.input(config.PC)).dontSimplifyIt().addAttribute(Verilator.public)
+  val lastStageIsValid = CombInit(stages.last.arbitration.isValid).dontSimplifyIt().addAttribute(Verilator.public)
+  val lastStageIsFiring = CombInit(stages.last.arbitration.isFiring).dontSimplifyIt().addAttribute(Verilator.public)
 
   //Verilator perf
   decode.arbitration.removeIt.noBackendCombMerge
   if(withMemoryStage){
     memory.arbitration.removeIt.noBackendCombMerge
   }
-  execute.arbitration.flushAll.noBackendCombMerge
-
-  this(RVC_GEN) = false
+  execute.arbitration.flushNext.noBackendCombMerge
 }
 
 

@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <time.h>
 #include <unistd.h>
+#include "verilated_fst_c.h"
 
 using namespace std;
 
@@ -126,7 +127,6 @@ public:
 
 
 class success : public std::exception { };
-static uint32_t workspaceCycles = 0;
 template <class T> class Workspace{
 public:
 
@@ -140,7 +140,7 @@ public:
 	string name;
 	uint64_t time = 0;
 	#ifdef TRACE
-	VerilatedVcdC* tfp;
+	VerilatedFstC* tfp;
 	#endif
 
 	ofstream logTraces;
@@ -179,14 +179,14 @@ public:
 		#endif
 	}
 
-	Workspace* run(uint32_t timeout = 5000){
+	Workspace* run(double timeout = 1e6){
 
 		// init trace dump
 		#ifdef TRACE
 		Verilated::traceEverOn(true);
-		tfp = new VerilatedVcdC;
+		tfp = new VerilatedFstC;
 		top->trace(tfp, 99);
-		tfp->open((string(name)+ ".vcd").c_str());
+		tfp->open((string(name)+ ".fst").c_str());
 		#endif
 
 		struct timespec start_time,tick_time;
@@ -204,6 +204,10 @@ public:
 					if(p->wakeEnable && p->wakeDelay < delay)
 						delay = p->wakeDelay;
 
+                if(time*timeToSec > timeout){
+                    printf("Simulation timeout triggered (%f)\n", time*timeToSec);
+                    fail();
+                }
 				if(delay == ~0l){
 					fail();
 				}
