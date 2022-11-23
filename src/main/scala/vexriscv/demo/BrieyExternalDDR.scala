@@ -48,9 +48,9 @@ class BrieyExternalDDR(config: BrieyConfig) extends Component{
 
   val io = new Bundle{
     //Clocks / reset
-    val asyncReset = in Bool
-    val axiClk     = in Bool
-    val vgaClk     = in Bool
+    val asyncReset = in Bool()
+    val axiClk     = in Bool()
+    val vgaClk     = in Bool()
 
     //Mai components IO
     val axi2dimm = slave(Axi4(axi2dimmConfig)).flip
@@ -62,7 +62,7 @@ class BrieyExternalDDR(config: BrieyConfig) extends Component{
     val uart          = master(Uart())
     val vga           = master(Vga(vgaRgbConfig))
     val timerExternal = in(PinsecTimerCtrlExternal())
-    val coreInterrupt = in Bool
+    val coreInterrupt = in Bool()
   }
 
   val resetCtrlClockDomain = ClockDomain(

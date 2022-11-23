@@ -453,6 +453,8 @@ object BrieyDe2115{
   def main(args: Array[String]) {
     object IS42x320B {
       def layout = SdramLayout(
+        // FIXME: Update with the correct value. Bypass compile error only.
+        generation = SDR,
         bankWidth   = 4,
         columnWidth = 10,
         rowWidth    = 13,

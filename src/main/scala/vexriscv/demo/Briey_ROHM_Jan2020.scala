@@ -173,8 +173,8 @@ class Briey_ROHM_Jan2020(config: Briey_ROHM_Config) extends Component{
   
   val io = new Bundle{
     //Clocks / reset
-    val asyncReset = in Bool
-    val axiClk     = in Bool
+    val asyncReset = in Bool()
+    val axiClk     = in Bool()
     
     //Main components IO
     val jtag  = slave(Jtag())
@@ -184,7 +184,7 @@ class Briey_ROHM_Jan2020(config: Briey_ROHM_Config) extends Component{
     val spi           = master(SpiMaster(config.spiCtrlConfig.ssWidth))
     val uart          = master(Uart())
     val timerExternal = in(PinsecTimerCtrlExternal())
-    val coreInterrupt = in Bool
+    val coreInterrupt = in Bool()
   }
 
   val resetCtrlClockDomain = ClockDomain(

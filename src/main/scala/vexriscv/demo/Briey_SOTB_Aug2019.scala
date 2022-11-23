@@ -14,7 +14,10 @@ import spinal.lib.com.uart.{Apb3UartCtrl, Uart, UartCtrlGenerics, UartCtrlMemory
 import spinal.lib.graphic.RgbConfig
 import spinal.lib.graphic.vga.{Axi4VgaCtrl, Axi4VgaCtrlGenerics, Vga}
 import spinal.lib.io.TriStateArray
+import spinal.lib.memory.sdram.SdramGeneration.SDR
 import spinal.lib.memory.sdram._
+import spinal.lib.memory.sdram.sdr.sim.SdramModel
+import spinal.lib.memory.sdram.sdr.{Axi4SharedSdramCtrl, IS42x320D, SdramInterface, SdramTimings}
 import spinal.lib.misc.HexTools
 import spinal.lib.soc.pinsec.{PinsecTimerCtrl, PinsecTimerCtrlExternal}
 import spinal.lib.system.debugger.{JtagAxi4SharedDebugger, JtagBridge, SystemDebugger, SystemDebuggerConfig}
@@ -173,8 +176,8 @@ class Briey_SOTB_Aug2019(config: Briey_SOTB_Config) extends Component{
   
   val io = new Bundle{
     //Clocks / reset
-    val asyncReset = in Bool
-    val axiClk     = in Bool
+    val asyncReset = in Bool()
+    val axiClk     = in Bool()
     
     //Main components IO
     val jtag  = slave(Jtag())
@@ -184,7 +187,7 @@ class Briey_SOTB_Aug2019(config: Briey_SOTB_Config) extends Component{
     val spi           = master(SpiMaster(config.spiCtrlConfig.ssWidth))
     val uart          = master(Uart())
     val timerExternal = in(PinsecTimerCtrlExternal())
-    val coreInterrupt = in Bool
+    val coreInterrupt = in Bool()
   }
 
   val resetCtrlClockDomain = ClockDomain(

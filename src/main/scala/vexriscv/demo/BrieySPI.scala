@@ -14,7 +14,10 @@ import spinal.lib.com.uart.{Apb3UartCtrl, Uart, UartCtrlGenerics, UartCtrlMemory
 import spinal.lib.graphic.RgbConfig
 import spinal.lib.graphic.vga.{Axi4VgaCtrl, Axi4VgaCtrlGenerics, Vga}
 import spinal.lib.io.TriStateArray
+import spinal.lib.memory.sdram.SdramGeneration.SDR
 import spinal.lib.memory.sdram._
+import spinal.lib.memory.sdram.sdr.sim.SdramModel
+import spinal.lib.memory.sdram.sdr.{Axi4SharedSdramCtrl, IS42x320D, SdramInterface, SdramTimings}
 import spinal.lib.misc.HexTools
 import spinal.lib.soc.pinsec.{PinsecTimerCtrl, PinsecTimerCtrlExternal}
 import spinal.lib.system.debugger.{JtagAxi4SharedDebugger, JtagBridge, SystemDebugger, SystemDebuggerConfig}
@@ -178,9 +181,9 @@ class BrieySPI(config: BrieySPIConfig) extends Component{
 
   val io = new Bundle{
     //Clocks / reset
-    val asyncReset = in Bool
-    val axiClk     = in Bool
-	val vgaClk     = in Bool
+    val asyncReset = in Bool()
+    val axiClk     = in Bool()
+	val vgaClk     = in Bool()
 
     //Main components IO
     val jtag       = slave(Jtag())
@@ -193,7 +196,7 @@ class BrieySPI(config: BrieySPIConfig) extends Component{
     val uart          = master(Uart())
 	val vga           = master(Vga(vgaRgbConfig))
     val timerExternal = in(PinsecTimerCtrlExternal())
-    val coreInterrupt = in Bool
+    val coreInterrupt = in Bool()
   }
 
   val resetCtrlClockDomain = ClockDomain(
@@ -438,9 +441,9 @@ class BrieySPIExternalDDR(config: BrieySPIConfig) extends Component{
 
   val io = new Bundle{
     //Clocks / reset
-    val asyncReset = in Bool
-    val axiClk     = in Bool
-	val vgaClk     = in Bool
+    val asyncReset = in Bool()
+    val axiClk     = in Bool()
+	val vgaClk     = in Bool()
 	
     //Main components IO
     val axi2dimm = slave(Axi4(axi2dimmConfig)).flip
@@ -453,7 +456,7 @@ class BrieySPIExternalDDR(config: BrieySPIConfig) extends Component{
     val uart          = master(Uart())
 	val vga           = master(Vga(vgaRgbConfig))
     val timerExternal = in(PinsecTimerCtrlExternal())
-    val coreInterrupt = in Bool
+    val coreInterrupt = in Bool()
   }
 
   val resetCtrlClockDomain = ClockDomain(
