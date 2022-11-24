@@ -27,6 +27,181 @@
 #include "../common/uart.h"
 
 
+class SDCardSpiIo{
+	public:
+		CData *CLK;
+		CData *CS;
+		CData *MISO;
+		CData *MOSI;
+};
+
+#define SD_ACK		0x00
+#define SD_IDLE		0x01
+#define SD_PATTERN	0x000001aa
+#define SD_CCS		0x40000000
+#define SD_WAIT		0x80
+#define SD_INVALID	0xff
+typedef enum SD_STATE {
+	SD_STATE_IDLE,
+	SD_STATE_CMD0,
+	SD_STATE_CMD8,
+	SD_STATE_CMD58,
+	SD_STATE_CMD16,
+	SD_STATE_CMD41,
+	SD_STATE_CMD55,
+	SD_STATE_RESPOND,
+} SD_state;
+
+class SDCardSpi : public SimElement {
+	#define MAX_CMD_BYTE 6
+	public:
+		SDCardSpiIo *io;
+		uint8_t curr_bit;
+		uint8_t curr_byte;
+		uint8_t rx_buff[MAX_CMD_BYTE];
+        uint8_t tx_buff[MAX_CMD_BYTE];
+	
+    uint8_t n_tx;
+	SD_state sd_state;
+	SD_state sd_lst_state;
+    bool is_return = false;
+	uint8_t ckeLast = 0;
+    
+	uint8_t tx_byte, rx_byte;
+	
+	SDCardSpi(SDCardSpiIo* io) {
+		this->io = io;
+		sd_state = SD_STATE_IDLE;
+		reset();
+	}
+	virtual ~SDCardSpi(){
+		;
+	}
+
+	virtual void postCycle(){
+	}
+
+	virtual void preCycle(){
+		if (!*io->CS && *io->CLK) {
+			if (!ckeLast) {
+                *io->MISO = (tx_byte >> (7 - curr_bit)) & 0x01;
+                rx_byte |= ((*io->MOSI & 0x01)<< (7 - curr_bit));
+				curr_bit++;
+				if (curr_bit == 8) {
+					curr_bit = 0;
+                    // Do SDCard logic
+                    do_something();
+				}
+			}
+		}
+		if (*io->CS) {
+			reset();
+		}
+		ckeLast = *io->CLK;
+	}
+
+    void do_something() {
+        uint8_t cmd;
+        uint32_t pattern;
+        rx_buff[curr_byte] = rx_byte;
+        rx_byte = 0;
+        if (is_return == true && curr_byte == n_tx - 1) {
+            curr_byte = 0;
+            is_return = false;
+        } else {
+            curr_byte++;
+        }
+
+        if (curr_byte == MAX_CMD_BYTE) {
+            curr_byte = 0;
+            cmd = rx_buff[0] & ~0x40;
+            // printf("cmd: %d\n",cmd);
+            switch (sd_state)
+            {
+            case SD_STATE_IDLE:
+                if (cmd == 0)
+                    tx_buff[0] = SD_IDLE;
+                else
+                    tx_buff[0] = SD_INVALID;
+                n_tx = 1;
+                sd_state = SD_STATE_CMD0;
+                is_return = true;
+                break;
+            case SD_STATE_CMD0:
+                if (cmd == 8) {
+                    pattern = rx_buff[1]<<24 | rx_buff[2]<<16 | rx_buff[3]<<8 | rx_buff[4];
+                    printf("Receive pattern 0x%04X\n", pattern);
+                    tx_buff[0] = SD_IDLE;
+                    tx_buff[1] = rx_buff[1];
+                    tx_buff[2] = rx_buff[2];
+                    tx_buff[3] = rx_buff[3];
+                    tx_buff[4] = rx_buff[4];
+                    sd_state = SD_STATE_CMD8;
+                    n_tx = 5;
+                } else {
+                    tx_buff[0] = SD_INVALID;
+                    sd_state = SD_STATE_IDLE;
+                    n_tx = 1;
+                }
+                is_return = true;
+            case SD_STATE_CMD8:
+                if (cmd == 55) {
+                    tx_buff[0] = SD_IDLE;
+                    sd_state = SD_STATE_CMD55;
+                } else {
+                    tx_buff[0] = SD_INVALID;
+                    sd_state = SD_STATE_IDLE;
+                }
+                n_tx = 1;
+                is_return = true;
+            case SD_STATE_CMD55:
+                if (cmd == 41) {
+                    tx_buff[0] = SD_ACK;
+                    sd_state = SD_STATE_CMD41;
+                } else {
+                    tx_buff[0] = SD_INVALID;
+                    sd_state = SD_STATE_IDLE;
+                }
+                n_tx = 1;
+            case SD_STATE_CMD41:
+                if (cmd == 58) {
+                    tx_buff[0] = SD_ACK;
+                    sd_state = SD_STATE_CMD58;
+                    tx_buff[0] = 0xc0;
+                    tx_buff[1] = rx_buff[1];
+                    tx_buff[2] = rx_buff[2];
+                    tx_buff[3] = rx_buff[3];
+                    n_tx = 4;
+                } else {
+                    tx_buff[0] = SD_INVALID;
+                    sd_state = SD_STATE_IDLE;
+                    n_tx = 1;
+                }
+            case SD_STATE_CMD58:
+                if (cmd == 16) {
+                    tx_buff[0] = SD_ACK;
+                    sd_state = SD_STATE_CMD16;
+                } else {
+                    tx_buff[0] = SD_INVALID;
+                    sd_state = SD_STATE_IDLE;
+                }
+                n_tx = 1;
+            case SD_STATE_CMD16:
+            default:
+                break;
+            }
+        }
+        tx_byte = tx_buff[curr_byte];
+        printf("Next tx byte %d curr_byte %d\n", tx_byte, curr_byte);
+    }
+	void reset() {
+        rx_byte = 0;
+        tx_byte = 0;
+		this->curr_bit = 0;
+		this->curr_byte = 0;
+		memset(rx_buff, 0, sizeof(rx_buff)/sizeof(rx_buff[0]));
+	}
+};
 
 class SdramConfig{
 public:
@@ -414,6 +589,14 @@ public:
 		// Sdram *sdram = new Sdram(sdramConfig, sdramIo);
 
 		// axiClk->add(sdram);
+
+		SDCardSpiIo	*sdcardio = new SDCardSpiIo();
+		sdcardio->CS 	= &top->io_spi_ss;
+		sdcardio->CLK 	= &top->io_spi_sclk;
+		sdcardio->MOSI 	= &top->io_spi_mosi;
+		sdcardio->MISO 	= (CData*)&top->io_spi_miso;
+		SDCardSpi *sdcard = new SDCardSpi(sdcardio);
+		axiClk->add(sdcard);
 		#ifdef TRACE
 		//speedFactor = 100e-6;
 		//cout << "Simulation caped to " << timeToSec << " of real time"<< endl;
