@@ -27,7 +27,7 @@
 #include "../common/uart.h"
 
 
-class SDCardSpiIo{
+class SpiIo {
 	public:
 		CData *CLK;
 		CData *CS;
@@ -52,35 +52,23 @@ typedef enum SD_STATE {
 	SD_STATE_RESPOND,
 } SD_state;
 
-class SDCardSpi : public SimElement {
-	#define MAX_CMD_BYTE 6
-	public:
-		SDCardSpiIo *io;
-		uint8_t curr_bit;
-		uint8_t curr_byte;
-		uint8_t rx_buff[MAX_CMD_BYTE];
-        uint8_t tx_buff[MAX_CMD_BYTE];
-	
-    uint8_t n_tx;
-	SD_state sd_state;
-	SD_state sd_lst_state;
-    bool is_return = false;
-	uint8_t ckeLast = 0;
-    
+
+class Spi : public SimElement {
+	#define BUFF_LEN 16
+  public:
+	SpiIo *io;
+	uint8_t curr_bit;
+	uint8_t curr_byte;
+	uint8_t rx_buff[BUFF_LEN];
+	uint8_t tx_buff[BUFF_LEN];
 	uint8_t tx_byte, rx_byte;
-	
-	SDCardSpi(SDCardSpiIo* io) {
+
+    bool is_return = false;
+    uint8_t n_tx;
+	uint8_t ckeLast = 0;
+	Spi(SpiIo* io) {
 		this->io = io;
-		sd_state = SD_STATE_IDLE;
-		reset();
 	}
-	virtual ~SDCardSpi(){
-		;
-	}
-
-	virtual void postCycle(){
-	}
-
 	virtual void preCycle(){
 		if (!*io->CS && *io->CLK) {
 			if (!ckeLast) {
@@ -89,8 +77,8 @@ class SDCardSpi : public SimElement {
 				curr_bit++;
 				if (curr_bit == 8) {
 					curr_bit = 0;
-                    // Do SDCard logic
-                    do_something();
+                    // Do receive byte logic
+                    receive_byte();
 				}
 			}
 		}
@@ -99,8 +87,33 @@ class SDCardSpi : public SimElement {
 		}
 		ckeLast = *io->CLK;
 	}
+	virtual void receive_byte(){}
+	void reset() {
+        rx_byte = 0;
+        tx_byte = 0;
+		this->curr_bit = 0;
+		this->curr_byte = 0;
+		memset(rx_buff, 0, sizeof(rx_buff)/sizeof(rx_buff[0]));
+	}
+};
 
-    void do_something() {
+class SDCardSpi : public Spi {
+	#define MAX_CMD_BYTE 6
+public:
+	SD_state sd_state;
+	SD_state sd_lst_state;
+    
+	
+	SDCardSpi(SpiIo* io) : Spi(io)  {
+		sd_state = SD_STATE_IDLE;
+		reset();
+	}
+	virtual ~SDCardSpi(){
+		;
+	}
+
+
+    void receive_byte() {
         uint8_t cmd;
         uint32_t pattern;
         rx_buff[curr_byte] = rx_byte;
@@ -115,7 +128,7 @@ class SDCardSpi : public SimElement {
         if (curr_byte == MAX_CMD_BYTE) {
             curr_byte = 0;
             cmd = rx_buff[0] & ~0x40;
-            // printf("cmd: %d\n",cmd);
+            // printf("cmd: %d rx_buff[0] %d\n",cmd, rx_buff[0]);
             switch (sd_state)
             {
             case SD_STATE_IDLE:
@@ -130,7 +143,7 @@ class SDCardSpi : public SimElement {
             case SD_STATE_CMD0:
                 if (cmd == 8) {
                     pattern = rx_buff[1]<<24 | rx_buff[2]<<16 | rx_buff[3]<<8 | rx_buff[4];
-                    printf("Receive pattern 0x%04X\n", pattern);
+                    // printf("Receive pattern 0x%04X\n", pattern);
                     tx_buff[0] = SD_IDLE;
                     tx_buff[1] = rx_buff[1];
                     tx_buff[2] = rx_buff[2];
@@ -144,6 +157,7 @@ class SDCardSpi : public SimElement {
                     n_tx = 1;
                 }
                 is_return = true;
+				break;
             case SD_STATE_CMD8:
                 if (cmd == 55) {
                     tx_buff[0] = SD_IDLE;
@@ -154,7 +168,9 @@ class SDCardSpi : public SimElement {
                 }
                 n_tx = 1;
                 is_return = true;
+				break;
             case SD_STATE_CMD55:
+				// printf("SD_STATE_CMD55\n");
                 if (cmd == 41) {
                     tx_buff[0] = SD_ACK;
                     sd_state = SD_STATE_CMD41;
@@ -163,20 +179,24 @@ class SDCardSpi : public SimElement {
                     sd_state = SD_STATE_IDLE;
                 }
                 n_tx = 1;
+				is_return = true;
+				break;
             case SD_STATE_CMD41:
                 if (cmd == 58) {
                     tx_buff[0] = SD_ACK;
                     sd_state = SD_STATE_CMD58;
-                    tx_buff[0] = 0xc0;
-                    tx_buff[1] = rx_buff[1];
-                    tx_buff[2] = rx_buff[2];
-                    tx_buff[3] = rx_buff[3];
-                    n_tx = 4;
+                    tx_buff[1] = 0xc0;
+                    tx_buff[2] = rx_buff[1];
+                    tx_buff[3] = rx_buff[2];
+                    tx_buff[4] = rx_buff[3];
+                    n_tx = 5;
                 } else {
                     tx_buff[0] = SD_INVALID;
                     sd_state = SD_STATE_IDLE;
                     n_tx = 1;
                 }
+				is_return = true;
+				break;
             case SD_STATE_CMD58:
                 if (cmd == 16) {
                     tx_buff[0] = SD_ACK;
@@ -186,21 +206,21 @@ class SDCardSpi : public SimElement {
                     sd_state = SD_STATE_IDLE;
                 }
                 n_tx = 1;
+				break;
             case SD_STATE_CMD16:
             default:
                 break;
             }
+			// printf("tx buff: n_tx %d\n", n_tx);
+			// for (int i=0; i < n_tx; i++) {
+			// 	printf("0x%02X ", tx_buff[i]);
+			// }
+			// printf("\n");
+			memset(rx_buff, 0, sizeof(rx_buff)/sizeof(rx_buff[0]));
         }
         tx_byte = tx_buff[curr_byte];
-        printf("Next tx byte %d curr_byte %d\n", tx_byte, curr_byte);
     }
-	void reset() {
-        rx_byte = 0;
-        tx_byte = 0;
-		this->curr_bit = 0;
-		this->curr_byte = 0;
-		memset(rx_buff, 0, sizeof(rx_buff)/sizeof(rx_buff[0]));
-	}
+
 };
 
 class SdramConfig{
@@ -590,7 +610,7 @@ public:
 
 		// axiClk->add(sdram);
 
-		SDCardSpiIo	*sdcardio = new SDCardSpiIo();
+		SpiIo	*sdcardio = new SpiIo();
 		sdcardio->CS 	= &top->io_spi_ss;
 		sdcardio->CLK 	= &top->io_spi_sclk;
 		sdcardio->MOSI 	= &top->io_spi_mosi;
